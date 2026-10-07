@@ -1,3 +1,11 @@
+# data files
+*.csv
+*_Patterns.txt
+
+
+# producer checkpoints
+.producer_checkpoint.json
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

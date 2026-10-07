@@ -1,0 +1,95 @@
+{
+  "Comment": "IS459 G2 Q2 - daily KYC customer risk scoring. Replace <BUCKET> before saving.",
+  "StartAt": "GlueETL",
+  "States": {
+    "GlueETL": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "aml-q2-etl",
+        "Arguments": {
+          "--run_date.$": "$.run_date",
+          "--bucket": "<BUCKET>"
+        }
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }],
+      "Next": "CreateCluster"
+    },
+    "CreateCluster": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::elasticmapreduce:createCluster.sync",
+      "Parameters": {
+        "Name": "aml-q2-scoring",
+        "ReleaseLabel": "emr-7.1.0",
+        "Applications": [{ "Name": "Spark" }],
+        "ServiceRole": "EMR_DefaultRole",
+        "JobFlowRole": "EMR_EC2_DefaultRole",
+        "LogUri": "s3://<BUCKET>/emr-logs/",
+        "VisibleToAllUsers": true,
+        "Instances": {
+          "KeepJobFlowAliveWhenNoSteps": true,
+          "InstanceGroups": [
+            { "Name": "Primary", "InstanceRole": "MASTER", "InstanceType": "m5.xlarge", "InstanceCount": 1 },
+            { "Name": "Core", "InstanceRole": "CORE", "InstanceType": "m5.xlarge", "InstanceCount": 1 }
+          ]
+        }
+      },
+      "ResultSelector": { "ClusterId.$": "$.ClusterId" },
+      "ResultPath": "$.cluster",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }],
+      "Next": "Score"
+    },
+    "Score": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::elasticmapreduce:addStep.sync",
+      "Parameters": {
+        "ClusterId.$": "$.cluster.ClusterId",
+        "Step": {
+          "Name": "score",
+          "ActionOnFailure": "CONTINUE",
+          "HadoopJarStep": {
+            "Jar": "command-runner.jar",
+            "Args.$": "States.Array('spark-submit', '--deploy-mode', 'cluster', 's3://<BUCKET>/scripts/score.py', '--bucket', '<BUCKET>', '--run-date', $.run_date, '--bank-id', '12', '--window-days', '7')"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "TerminateOnFailure" }],
+      "Next": "Validate"
+    },
+    "Validate": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::elasticmapreduce:addStep.sync",
+      "Parameters": {
+        "ClusterId.$": "$.cluster.ClusterId",
+        "Step": {
+          "Name": "validate",
+          "ActionOnFailure": "CONTINUE",
+          "HadoopJarStep": {
+            "Jar": "command-runner.jar",
+            "Args.$": "States.Array('spark-submit', '--deploy-mode', 'cluster', 's3://<BUCKET>/scripts/validate.py', '--bucket', '<BUCKET>', '--run-date', $.run_date, '--bank-id', '12', '--window-days', '7')"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "TerminateOnFailure" }],
+      "Next": "Terminate"
+    },
+    "Terminate": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::elasticmapreduce:terminateCluster.sync",
+      "Parameters": { "ClusterId.$": "$.cluster.ClusterId" },
+      "ResultPath": null,
+      "End": true
+    },
+    "TerminateOnFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::elasticmapreduce:terminateCluster.sync",
+      "Parameters": { "ClusterId.$": "$.cluster.ClusterId" },
+      "ResultPath": null,
+      "Next": "Failed"
+    },
+    "Failed": { "Type": "Fail", "Error": "PipelineFailed", "Cause": "See the failed state's error output" }
+  }
+}

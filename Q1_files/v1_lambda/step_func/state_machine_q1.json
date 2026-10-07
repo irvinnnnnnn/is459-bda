@@ -1,0 +1,115 @@
+{
+  "Comment": "IS459 G2 Q1 - model pipeline. Input {\"mode\": \"setup\"} once, then {\"mode\": \"retrain\"}. Replace <BUCKET>  and <ACCOUNT_ID> before saving.",
+  "StartAt": "BuildFeatures",
+  "States": {
+    "BuildFeatures": {
+      "Type": "Task",
+      "Comment": "Glue: join labels, clean, filter to our bank, build features, time split (+ seed DynamoDB at setup)",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "q1-features",
+        "Arguments": { "--mode.$": "$.mode" }
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }],
+      "Next": "Train"
+    },
+    "Train": {
+      "Type": "Task",
+      "Comment": "SageMaker: train LightGBM for our bank, set the 1% alert threshold, save to models/archive/<version>/",
+      "Resource": "arn:aws:states:::sagemaker:createTrainingJob.sync",
+      "Parameters": {
+        "TrainingJobName.$": "States.Format('q1-train-{}', $$.Execution.Name)",
+        "RoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/LabRole",
+        "AlgorithmSpecification": {
+          "TrainingImage": "683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-scikit-learn:1.2-1-cpu-py3",
+          "TrainingInputMode": "File"
+        },
+        "HyperParameters": {
+          "sagemaker_program": "\"train.py\"",
+          "sagemaker_submit_directory": "\"s3://<BUCKET>/q1/code/train.tar.gz\"",
+          "bucket": "\"<BUCKET>\"",
+          "bank": "\"11\"",
+          "version.$": "$$.Execution.Name"
+        },
+        "InputDataConfig": [{
+          "ChannelName": "train",
+          "DataSource": { "S3DataSource": {
+            "S3DataType": "S3Prefix",
+            "S3Uri": "s3://<BUCKET>/q1/features/",
+            "S3DataDistributionType": "FullyReplicated"
+          }}
+        }],
+        "OutputDataConfig": { "S3OutputPath": "s3://<BUCKET>/q1/sagemaker-output/" },
+        "ResourceConfig": { "InstanceType": "ml.m5.large", "InstanceCount": 1, "VolumeSizeInGB": 10 },
+        "StoppingCondition": { "MaxRuntimeInSeconds": 3600 }
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }],
+      "Next": "IsSetup"
+    },
+    "IsSetup": {
+      "Type": "Choice",
+      "Comment": "First model has nothing to compare against",
+      "Choices": [{ "Variable": "$.mode", "StringEquals": "setup", "Next": "Promote" }],
+      "Default": "Evaluate"
+    },
+    "Evaluate": {
+      "Type": "Task",
+      "Comment": "SageMaker Processing: new vs best on the same fixed benchmark + recent reviewed days",
+      "Resource": "arn:aws:states:::sagemaker:createProcessingJob.sync",
+      "Parameters": {
+        "ProcessingJobName.$": "States.Format('q1-eval-{}', $$.Execution.Name)",
+        "RoleArn": "arn:aws:iam::<ACCOUNT_ID>:role/LabRole",
+        "AppSpecification": {
+          "ImageUri": "683313688378.dkr.ecr.us-east-1.amazonaws.com/sagemaker-scikit-learn:1.2-1-cpu-py3",
+          "ContainerEntrypoint": ["python3", "/opt/ml/processing/code/evaluate.py"],
+          "ContainerArguments.$": "States.Array('--version', $$.Execution.Name)"
+        },
+        "ProcessingInputs": [
+          { "InputName": "code", "S3Input": {
+              "S3Uri": "s3://<BUCKET>/q1/code/evaluate.py", "LocalPath": "/opt/ml/processing/code",
+              "S3DataType": "S3Prefix", "S3InputMode": "File" } },
+          { "InputName": "features", "S3Input": {
+              "S3Uri": "s3://<BUCKET>/q1/features/", "LocalPath": "/opt/ml/processing/features",
+              "S3DataType": "S3Prefix", "S3InputMode": "File" } },
+          { "InputName": "models", "S3Input": {
+              "S3Uri": "s3://<BUCKET>/q1/models/", "LocalPath": "/opt/ml/processing/models",
+              "S3DataType": "S3Prefix", "S3InputMode": "File" } }
+        ],
+        "ProcessingOutputConfig": { "Outputs": [{
+          "OutputName": "evaluation",
+          "S3Output": {
+            "S3Uri.$": "States.Format('s3://<BUCKET>/q1/evaluation/{}/', $$.Execution.Name)",
+            "LocalPath": "/opt/ml/processing/output",
+            "S3UploadMode": "EndOfJob"
+          }
+        }]},
+        "ProcessingResources": { "ClusterConfig": {
+          "InstanceCount": 1, "InstanceType": "ml.m5.large", "VolumeSizeInGB": 10 } },
+        "StoppingCondition": { "MaxRuntimeInSeconds": 1800 }
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }],
+      "Next": "Promote"
+    },
+    "Promote": {
+      "Type": "Task",
+      "Comment": "Lambda: copy the winner to models/best/ (setup always promotes)",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "q1-promote",
+        "Payload": {
+          "mode.$": "$.mode",
+          "version.$": "$$.Execution.Name",
+          "bucket": "<BUCKET>"
+        }
+      },
+      "ResultSelector": { "result.$": "$.Payload" },
+      "ResultPath": "$.promote",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }],
+      "End": true
+    },
+    "Failed": { "Type": "Fail", "Error": "PipelineFailed", "Cause": "See the failed state's error output" }
+  }
+}
