@@ -792,12 +792,110 @@ def _activity(it):
     st.caption(f"{len(pv)} payments up to this one, newest first. Counterparties are shown as bank_account.")
 
 
+def _flow_nodes(df, keep):
+    """Per counterparty: payments, total and currency. The 8 largest, always including `keep`."""
+    g = df.groupby("counterparty").agg(n=("amount", "size"), amt=("amount", "sum"), curs=("currency", "nunique"),
+                                       cur=("currency", "first")).sort_values("amt", ascending=False)
+    top = g.head(8)
+    if keep in g.index and keep not in top.index:
+        top = pd.concat([g.head(7), g.loc[[keep]]])
+    return top, len(g)
+
+
+def _flow_label(n, amt, curs, cur, noun="payment"):
+    return f"{n:,} {noun}{'' if n == 1 else 's'} · " + (money(amt, cur) if curs == 1 else "mixed currencies")
+
+
+_FLOW_SPANS = {"Last 48 hours": 2, "Last 72 hours": 3, "Last 7 days": 7}
+
+
+def _flow(it):
+    """Who paid this account and who it paid, in the days up to the alerted payment (same data as above)."""
+    tid, sides = it["txn_id"], _our_sides(it)
+    side = st.session_state.get(f"acct_{tid}")
+    side = side if side in sides else sides[0]
+    if not DEMO and not st.session_state.get(f"show_{tid}"):
+        st.caption("Turn on \"Load this account's payments\" above to see the flow.")
+        return
+    try:
+        df = account_activity(it, side)
+    except Exception as exc:
+        st.error(f"Payments could not be loaded: {exc}")
+        return
+    span = st.columns([1, 3])[0].selectbox("Period", list(_FLOW_SPANS), key=f"span_{tid}",
+                                           label_visibility="collapsed")
+    df = df[df.ts >= it["txn_ts"] - _FLOW_SPANS[span] * DAY]
+    if df.empty:
+        st.caption(f"No payments on this account in the {span.lower()} before this payment.")
+        return
+    me = f"{it[side + '_bank']}_{it[side + '_account']}"
+    other = f"{it['to_bank']}_{it['to_account']}" if side == "from" else f"{it['from_bank']}_{it['from_account']}"
+    hot = "out" if side == "from" else "in"
+    loops = df[(df.counterparty == me) & (df.direction == "out")]   # self-transfers are in the data twice
+    df = df[df.counterparty != me]
+    cols = {d: _flow_nodes(df[df.direction == d], other if d == hot else None) for d in ("in", "out")}
+    both = set(cols["in"][0].index) | set(cols["out"][0].index)
+    both &= set(df[df.direction == "in"].counterparty) & set(df[df.direction == "out"].counterparty)
+
+    top = 30 + (46 if len(loops) else 0)
+    rows = max(len(nodes) + (total > len(nodes)) for nodes, total in cols.values())
+    body = max(rows * 46, 52)
+    cy, height = top + body / 2, top + body + 6
+    biggest = max([nodes.amt.max() for nodes, _ in cols.values() if len(nodes)] + [0])
+    text = "font-family='Segoe UI, system-ui, sans-serif' font-size='11'"
+    edges, boxes = [], []
+    for d, x in (("in", 0), ("out", 650)):
+        nodes, total = cols[d]
+        boxes.append(f"<text x='{x}' y='14' {text} fill='{MUTED}' letter-spacing='.08em'>"
+                     f"{'PAID IN' if d == 'in' else 'PAID OUT'}</text>")
+        for i, (cp, r) in enumerate(nodes.iterrows()):
+            y = top + i * 46 + 23
+            alerted = d == hot and cp == other
+            width = 1.5 + (8.5 * np.log1p(r.amt) / np.log1p(biggest) if biggest > 0 else 0)
+            path = f"M250,{y} C300,{y} 300,{cy} 350,{cy}" if d == "in" else f"M550,{cy} C600,{cy} 600,{y} 650,{y}"
+            edges.append(f"<path d='{path}' fill='none' stroke='{RED if alerted else '#4A5A78'}' "
+                         f"stroke-width='{width:.1f}' stroke-opacity='{1 if alerted else .8}' stroke-linecap='round'/>")
+            edge = RED if alerted else AMBER if cp in both else LINE
+            dash = " stroke-dasharray='4 3'" if cp in both and not alerted else ""
+            name = cp if len(cp) <= 24 else cp[:23] + "…"
+            boxes.append(
+                f"<rect x='{x}' y='{y - 18}' width='250' height='36' rx='6' fill='#111826' stroke='{edge}'{dash}/>"
+                f"<text x='{x + 10}' y='{y - 3}' font-family='Segoe UI, system-ui, sans-serif' font-size='13' font-weight='600' "
+                f"fill='{'#8FB4FF' if is_ours(cp.split('_')[0]) else INK}'>{esc(name)}</text>"
+                f"<text x='{x + 10}' y='{y + 12}' {text} fill='{MUTED}'>"
+                f"{esc(_flow_label(r.n, r.amt, r.curs, r.cur))}</text>")
+            if alerted:
+                boxes.append(f"<text x='{x + 240}' y='{y - 3}' text-anchor='end' {text} fill='#FF8A82'>"
+                             f"This payment</text>")
+            if cp in both:
+                boxes.append(f"<text x='{x + 240}' y='{y + (12 if alerted else -3)}' text-anchor='end' {text} "
+                             f"fill='{AMBER}'>Both sides</text>")
+        if total > len(nodes):
+            boxes.append(f"<text x='{x + 10}' y='{top + len(nodes) * 46 + 27}' {text} fill='{MUTED}'>"
+                         f"+ {total - len(nodes)} more accounts with smaller totals</text>")
+    if len(loops):
+        ry = cy - 26
+        edges.append(f"<path d='M415,{ry} C395,{ry - 42} 505,{ry - 42} 485,{ry}' fill='none' "
+                     f"stroke='{RED if other == me else '#4A5A78'}' stroke-width='2' stroke-linecap='round'/>")
+        boxes.append(f"<text x='450' y='{ry - 38}' text-anchor='middle' {text} fill='{MUTED}'>" + esc(_flow_label(
+            len(loops), loops.amount.sum(), loops.currency.nunique(), loops.currency.iloc[0], "transfer")
+            .replace(" · ", " to itself · ")) + "</text>")
+    boxes.append(
+        f"<rect x='350' y='{cy - 26}' width='200' height='52' rx='6' fill='#1B2538' stroke='#8FB4FF'/>"
+        f"<text x='450' y='{cy - 3}' text-anchor='middle' font-family='Segoe UI, system-ui, sans-serif' font-size='13' font-weight='600' "
+        f"fill='{INK}'>{esc(me)}</text>"
+        f"<text x='450' y='{cy + 14}' text-anchor='middle' {text} fill='#8FB4FF'>Customer account</text>")
+    # st.html strips inline SVG, so the drawing goes through st.image
+    st.image(f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 900 {height}' width='900' height='{height}'>"
+             + "".join(edges + boxes) + "</svg>", width="stretch")
+
+
 def _related(it, items):
     mine = {f"{it[s + '_bank']}_{it[s + '_account']}" for s in _our_sides(it)}
     rel = [o for o in items if o["txn_id"] != it["txn_id"] and mine & {
         f"{o['from_bank']}_{o['from_account']}", f"{o['to_bank']}_{o['to_account']}"}]
     if not rel:
-        st.html("<div class='sub'>No other alerts or audit items on this customer in the last 7 days.</div>")
+        st.html("<div class='sub'>No other alerts or audit items on this account in the last 7 days.</div>")
         return
     rel.sort(key=lambda o: -o["created_at"])
     st.dataframe(pd.DataFrame({
@@ -917,10 +1015,13 @@ def alert_page(kind, it):
             st.markdown("##### Risk factors" if not it["is_audit"] else "##### What the model saw")
             _risk_factors(it)
         with st.container(border=True, key=f"card_act_{tid}"):
-            st.markdown("##### Customer activity")
+            st.markdown("##### Account activity")
             _activity(it)
+        with st.container(border=True, key=f"card_flow_{tid}"):
+            st.markdown("##### Money flow around this payment")
+            _flow(it)
         with st.container(border=True, key=f"card_rel_{tid}"):
-            st.markdown("##### Other alerts on this customer")
+            st.markdown("##### Other alerts on this account")
             _related(it, items)
     with right:
         with st.container(border=True, key=f"card_dec_{tid}"):
