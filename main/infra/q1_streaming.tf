@@ -207,6 +207,14 @@ resource "aws_kinesisanalyticsv2_application" "q1" {
     application_snapshot_configuration {
       snapshots_enabled = true # a stop/start keeps the 7-day state
     }
+
+    # A code change that adds or removes a step must not block the restart: state for steps that
+    # no longer exist is dropped, the rest is restored.
+    run_configuration {
+      flink_run_configuration {
+        allow_non_restored_state = true
+      }
+    }
   }
 
   cloudwatch_logging_options {

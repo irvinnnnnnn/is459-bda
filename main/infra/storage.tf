@@ -34,6 +34,7 @@ locals {
     "code/glue/q1_build_training.py"      = "${local.main}/Q1_files/glue/q1_build_training.py"
     "code/glue/q2_etl.py"                 = "${local.main}/Q2_files/glue/q2_etl.py"
     "code/emr/q2_score.py"                = "${local.main}/Q2_files/emr/q2_score.py"
+    "code/emr/bootstrap.sh"               = "${local.main}/Q2_files/emr/bootstrap.sh"
     "code/sagemaker/evaluate/evaluate.py" = "${local.main}/Q1_files/sagemaker/evaluate.py"
     "code/sagemaker/train.tar.gz"         = "${local.build}/train.tar.gz"
   }

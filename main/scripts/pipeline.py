@@ -77,7 +77,7 @@ def wait_flink(cfg, want):
         ka, st = flink_status(cfg)
         if st == want:
             return log(f"Flink application is {st}")
-        if st not in ("STARTING", "STOPPING", "UPDATING", "AUTOSCALING"):
+        if st not in ("STARTING", "STOPPING", "FORCE_STOPPING", "UPDATING", "AUTOSCALING"):
             sys.exit(f"Flink application is {st}; expected {want}. See /aws/managed-flink/{cfg['flink_app']} in CloudWatch Logs.")
         time.sleep(15)
 
@@ -99,7 +99,8 @@ def cmd_start(cfg, a):
         ka.start_application(ApplicationName=cfg["flink_app"])
         log("starting Flink (about 3 minutes) ...")
     wait_flink(cfg, "RUNNING")
-    print("Give it a minute to load the model and the 7-day seed, then start the producer.")
+    print("Wait about 3 minutes before starting the producer: Flink is loading the last 7 days of history.")
+    print("(In the Flink dashboard, the seed-last-7-days step shows FINISHED when it is done.)")
 
 
 def cmd_stop(cfg, a):
@@ -130,7 +131,8 @@ def cmd_reset(cfg, a):
                  "Add --yes to go ahead.")
     _, st = flink_status(cfg)
     if st != "READY":
-        sys.exit("Stop Flink first (python pipeline.py stop). Its state would otherwise still hold the old replay.")
+        sys.exit(f"Flink is {st}. It must be stopped first (python pipeline.py stop), or its memory would still "
+                 "hold the old replay. If it says STOPPING, wait a minute and try again.")
     table = boto3.resource("dynamodb", region_name=cfg["region"]).Table(cfg["alerts_table"])
     kw, n = {"ProjectionExpression": "txn_id"}, 0
     with table.batch_writer() as w:

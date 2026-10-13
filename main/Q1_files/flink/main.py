@@ -18,14 +18,16 @@ from datetime import datetime, timezone
 
 from pyflink.common import Duration, Types, WatermarkStrategy
 from pyflink.common.watermark_strategy import TimestampAssigner
-from pyflink.datastream import KeyedProcessFunction, OutputTag, ProcessFunction, StreamExecutionEnvironment
+from pyflink.datastream import KeyedProcessFunction, ProcessFunction, StreamExecutionEnvironment
 from pyflink.datastream.state import ListStateDescriptor, ValueStateDescriptor
 from pyflink.table import StreamTableEnvironment
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PROPS_FILE = "/etc/flink/application_properties.json"
 IS_LOCAL = not os.path.exists(PROPS_FILE)
-DLQ = OutputTag("dlq", Types.STRING())
+# Rejected records travel in the main output, marked with this key, and are split off with a filter.
+# (PyFlink side outputs fail on Managed Flink when the operator is chained after a Table source.)
+DLQ = "__dlq__"
 DAY_MS = 86400 * 1000
 
 
@@ -52,7 +54,7 @@ class Parse(ProcessFunction):
             p = aml_clean.clean_json(raw)
         except aml_clean.Reject as exc:
             if not self.seed:
-                yield DLQ, dlq_line(raw, str(exc))
+                yield (DLQ, None, dlq_line(raw, str(exc)))
             return
         if not aml_clean.involves_bank(p, self.our_bank):
             return
@@ -211,26 +213,26 @@ def main():
         )""")
     live = t_env.to_data_stream(t_env.sql_query("SELECT data, CAST(arrival_time AS STRING) FROM transactions"))
     parsed = live.process(Parse(str(int(props["our.bank"])), False)).name("clean")
-    halves = parsed
+    halves = parsed.filter(lambda v: v[0] != DLQ).name("kept")
     seed_path = (props.get("seed.path") or "").strip()
     if seed_path:
         from pyflink.datastream.connectors.file_system import FileSource, StreamFormat
         source = FileSource.for_record_stream_format(StreamFormat.text_line_format(), seed_path).build()
         seed = env.from_source(source, WatermarkStrategy.no_watermarks(), "seed-last-7-days")
-        halves = parsed.union(seed.process(Parse(str(int(props["our.bank"])), True)).name("clean-seed"))
+        halves = halves.union(seed.process(Parse(str(int(props["our.bank"])), True)).name("clean-seed"))
 
     watermarks = (WatermarkStrategy.for_bounded_out_of_orderness(Duration.of_seconds(120))
                   .with_timestamp_assigner(EventTime()).with_idleness(Duration.of_seconds(60)))
     scored = (halves.assign_timestamps_and_watermarks(watermarks)
               .key_by(lambda v: v[0], key_type=Types.STRING())
-              .process(AccountFeatures()).name("account-features")
+              .process(AccountFeatures()).name("account-features").uid("account-features")
               .key_by(lambda v: v[0], key_type=Types.STRING())
-              .process(Score(props)).name("score-and-explain"))
+              .process(Score(props)).name("score-and-explain").uid("score-and-explain"))
     (scored.key_by(lambda v: v[0], key_type=Types.INT())
-     .process(S3Batch(props, "scored")).name("sink-curated-live-scored"))
-    (parsed.get_side_output(DLQ).map(lambda line: (0, line))
+     .process(S3Batch(props, "scored")).name("sink-curated-live-scored").uid("sink-scored"))
+    (parsed.filter(lambda v: v[0] == DLQ).map(lambda v: (0, v[2])).name("rejected")
      .key_by(lambda v: v[0], key_type=Types.INT())
-     .process(S3Batch(props, "dlq")).name("sink-dlq"))
+     .process(S3Batch(props, "dlq")).name("sink-dlq").uid("sink-dlq"))
     env.execute("q1-realtime-flagging")
 
 

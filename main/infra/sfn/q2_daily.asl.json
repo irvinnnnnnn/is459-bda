@@ -31,6 +31,9 @@
         "JobFlowRole": "${emr_instance_profile}",
         "LogUri": "s3://${bucket}/logs/emr/",
         "VisibleToAllUsers": true,
+        "BootstrapActions": [
+          { "Name": "install-boto3", "ScriptBootstrapAction": { "Path": "s3://${bucket}/code/emr/bootstrap.sh" } }
+        ],
         "Instances": {
           "KeepJobFlowAliveWhenNoSteps": true,
           "Ec2SubnetId": "${subnet}",
