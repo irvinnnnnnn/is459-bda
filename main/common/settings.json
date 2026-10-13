@@ -1,0 +1,5 @@
+{
+  "_about": "The one place to say whose view the pipelines take. The producer streams every bank's payments; Flink (Q1) and the Glue jobs (Q1 history, Q2) keep only the payments that involve our_bank. After changing a value: run terraform apply (it passes the value to every job), then pipeline.py reset and pipeline.py setup, because the history features and the model are per bank.",
+  "our_bank": "11",
+  "live_start": "2022-09-08"
+}

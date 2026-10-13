@@ -9,21 +9,23 @@ payments with the pipeline's own feature and scoring code. Nothing shown is inve
 thresholds, reasons and account payments are what the model and pipeline produce. The demo clock
 runs at one simulated minute per real second, starting 12 hours into the first live day.
 
-Against AWS:
+Against AWS (after terraform apply, which writes main/config.json with the resource names):
     set Q1_MODE=aws            (Mac/Linux: export Q1_MODE=aws)
-    set S3_BUCKET=<bucket>
-    streamlit run q1_streamlit.py --server.address 0.0.0.0 --server.port 8501
+    streamlit run q1_streamlit.py
 
-Optional env vars: AWS_REGION (us-east-1), BANK_ID (11), ALERTS_TABLE (q1-alerts), ATHENA_DB (aml),
-ATHENA_WORKGROUP (primary), LIVE_TABLE (curated_live), REFRESH_SECONDS (3).
+Each name in config.json can be overridden by an env var: AWS_REGION, S3_BUCKET, BANK_ID, ALERTS_TABLE,
+ATHENA_DB, ATHENA_WORKGROUP, LIVE_TABLE (live_scored), REFRESH_SECONDS (3).
+
+Time. Against AWS the app's "now" is the producer's simulated clock (state/sim_clock.json in the
+bucket; see main/common/sim_clock.py), so the 7-day review window, "expires in" and the decision
+times move with the replay. With no clock file the app uses the real time.
 
 Where each thing on screen comes from (spec: "apps read DynamoDB; pipelines read S3"):
-  Worklist, payment, priority, score, risk factors, 7-day figures   the alert item Flink writes to DynamoDB
-  Priority band                                              score against cut-offs saved with the model
-  Due in                                                     the item's 7-day TTL
+  Worklist, payment, score, risk factors, 7-day figures      the alert item Flink writes to DynamoDB
+  Due in                                                     the item's expires_at (7 days after it was raised)
   Other alerts on the customer                               the same DynamoDB table
   Decision, reason code, comment                             conditional write to that item
-  Customer's payments                                        Athena query on curated/live/
+  Customer's payments                                        Athena query on curated/live/scored/
 """
 import html
 import json
@@ -40,13 +42,16 @@ import pandas as pd
 import streamlit as st
 
 DEMO = os.getenv("Q1_MODE", "demo").strip().lower() != "aws"
-REGION = os.getenv("AWS_REGION", "us-east-1")
-S3_BUCKET = os.getenv("S3_BUCKET", "")
-BANK_ID = str(int(os.getenv("BANK_ID", "11")))
-ALERTS_TABLE = os.getenv("ALERTS_TABLE", "q1-alerts")
-ATHENA_DB = os.getenv("ATHENA_DB", "aml")
-ATHENA_WG = os.getenv("ATHENA_WORKGROUP", "primary")
-LIVE_TABLE = os.getenv("LIVE_TABLE", "curated_live")
+_CFG_FILE = Path(__file__).resolve().parents[2] / "config.json"     # written by terraform apply
+_CFG = json.loads(_CFG_FILE.read_text()) if _CFG_FILE.exists() else {}
+REGION = os.getenv("AWS_REGION", _CFG.get("region", "us-east-1"))
+S3_BUCKET = os.getenv("S3_BUCKET", _CFG.get("bucket", ""))
+BANK_ID = str(int(os.getenv("BANK_ID", _CFG.get("our_bank", "11"))))
+ALERTS_TABLE = os.getenv("ALERTS_TABLE", _CFG.get("alerts_table", "aml-q1-alerts"))
+ATHENA_DB = os.getenv("ATHENA_DB", _CFG.get("athena_db", "aml"))
+ATHENA_WG = os.getenv("ATHENA_WORKGROUP", _CFG.get("athena_workgroup", "primary"))
+LIVE_TABLE = os.getenv("LIVE_TABLE", "live_scored")       # the table over curated/live/scored/
+LABELS_TABLE = os.getenv("LABELS_TABLE", "live_labels")   # the table over curated/live/labels/
 REFRESH = int(os.getenv("REFRESH_SECONDS", "3"))
 
 DAY = 86400
@@ -55,7 +60,6 @@ PAGE = 10                           # queue rows shown before "Show more"
 OUTCOME = {"open": "Open", "confirmed": "Marked as suspicious", "dismissed": "Closed, not suspicious"}
 KIND = {"Alerts": False, "Audit": True}        # view name -> is_audit
 SORTS = {"Alerts": ["Highest risk", "Oldest first", "Newest first"], "Audit": ["Oldest first", "Newest first"]}
-BANDS = ["High", "Medium", "Low"]
 # Disposition reason codes, recorded with each decision.
 REASONS = {
     "confirmed": ["Money passed straight through the account", "Many senders paying into one account",
@@ -135,13 +139,38 @@ def _demo():
 
 
 # =============================================================== AWS backend ====
-# Attribute and column names are this app's contract with the Flink job; they match the item
-# layout in demo_snapshot.json. Not yet run against real tables.
+# Attribute and column names are this app's contract with the Flink job (q1_core.alert_item and
+# q1_scoring.scored_columns); they match the item layout in demo_snapshot.json.
 @st.cache_resource
 def _aws():
     import boto3
     s = boto3.Session(region_name=REGION)
-    return {"alerts": s.resource("dynamodb").Table(ALERTS_TABLE), "athena": s.client("athena")}
+    return {"alerts": s.resource("dynamodb").Table(ALERTS_TABLE), "athena": s.client("athena"),
+            "s3": s.client("s3"), "cloudwatch": s.client("cloudwatch"), "sfn": s.client("stepfunctions")}
+
+
+_CLOCK = {"read_at": 0.0, "state": None}
+
+
+def _sim_now():
+    """The producer's simulated clock, or the real time when no replay is running."""
+    if S3_BUCKET and time.time() - _CLOCK["read_at"] > 5:
+        try:
+            body = _aws()["s3"].get_object(Bucket=S3_BUCKET, Key="state/sim_clock.json")["Body"].read()
+            _CLOCK["state"] = json.loads(body)
+        except Exception:
+            _CLOCK["state"] = None
+        _CLOCK["read_at"] = time.time()
+    c = _CLOCK["state"]
+    if not c:
+        return time.time()
+    if not c.get("running"):
+        return float(c["sim_anchor"])
+    return float(c["sim_anchor"]) + (time.time() - float(c["wall_anchor"])) * float(c["speed"])
+
+
+def _day(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")
 
 
 def _athena(sql):
@@ -182,7 +211,7 @@ def _norm(raw):
     it.setdefault("created_at", time.time())
     it.setdefault("expires_at", it["created_at"] + TTL)
     for k in ("reviewer", "note", "reason", "decided_at", "from_bank", "to_bank", "model_version", "features",
-              "priority", "claimed_by"):
+              "claimed_by"):
         it.setdefault(k, None)
     return it
 
@@ -195,7 +224,7 @@ def _aws_items():
         if "LastEvaluatedKey" not in r:
             break
         kw["ExclusiveStartKey"] = r["LastEvaluatedKey"]
-    now = time.time()                      # TTL deletes lag, so drop expired items here too
+    now = _sim_now()                       # past its 7-day window: hidden here, removed by the label export
     return [it for it in map(_norm, items) if it["expires_at"] > now]
 
 
@@ -203,16 +232,17 @@ def _aws_decide(tid, status, reviewer, note, expect, reason=""):
     from botocore.exceptions import ClientError
     try:
         mine = " AND (attribute_not_exists(claimed_by) OR claimed_by = :r)" if expect == "open" else ""
+        t = int(_sim_now())                # the outcome is final once the 7-day window has closed
         _aws()["alerts"].update_item(
-            Key={"txn_id": tid}, ConditionExpression="#s = :f" + mine,
+            Key={"txn_id": tid}, ConditionExpression="#s = :f AND expires_at > :t" + mine,
             UpdateExpression="SET #s = :s, reviewer = :r, decided_at = :t, note = :n, reason = :q REMOVE claimed_by",
             ExpressionAttributeNames={"#s": "status"},
-            ExpressionAttributeValues={":s": status, ":f": expect, ":r": reviewer, ":n": note, ":q": reason,
-                                       ":t": int(time.time())})
+            ExpressionAttributeValues={":s": status, ":f": expect, ":r": reviewer, ":n": note, ":q": reason, ":t": t})
         return True, ""
     except ClientError as exc:
         if exc.response["Error"]["Code"] == "ConditionalCheckFailedException":
-            return False, "Someone else already changed this item. The queue has the latest state."
+            return False, ("Someone else already changed this item, or its review window has closed. "
+                           "The queue has the latest state.")
         raise
 
 
@@ -241,19 +271,84 @@ def _aws_activity(bank, account, until_ts):
         SELECT to_unixtime(txn_ts) AS ts, 'in' AS direction,
                concat(cast(from_bank AS varchar), '_', from_account) AS counterparty,
                amount_received AS amount, receiving_currency AS currency, payment_format AS format
-        FROM {LIVE_TABLE} WHERE {mine_to}
+        FROM {LIVE_TABLE} WHERE {mine_to} AND date BETWEEN '{_day(until_ts - 30 * DAY)}' AND '{_day(until_ts)}'
           AND txn_ts BETWEEN from_unixtime({until_ts - 30 * DAY}) AND from_unixtime({until_ts})
         UNION ALL
         SELECT to_unixtime(txn_ts), 'out', concat(cast(to_bank AS varchar), '_', to_account),
                amount_paid, payment_currency, payment_format
-        FROM {LIVE_TABLE} WHERE {mine_from}
+        FROM {LIVE_TABLE} WHERE {mine_from} AND date BETWEEN '{_day(until_ts - 30 * DAY)}' AND '{_day(until_ts)}'
           AND txn_ts BETWEEN from_unixtime({until_ts - 30 * DAY}) AND from_unixtime({until_ts})""")
     return df.astype({"ts": float, "amount": float}) if len(df) else df
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _aws_traffic(first_day):
+    df = _athena(f"""
+        SELECT to_unixtime(date_trunc('hour', txn_ts)) AS hour, count(DISTINCT txn_id) AS payments,
+               count(DISTINCT CASE WHEN is_alert THEN txn_id END) AS alerts
+        FROM {LIVE_TABLE} WHERE date >= '{first_day}' GROUP BY 1 ORDER BY 1""")
+    return df.astype(float) if len(df) else pd.DataFrame(columns=["hour", "payments", "alerts"])
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _aws_expired(first_day):
+    df = _athena(f"SELECT count(DISTINCT txn_id) FROM {LABELS_TABLE} "
+                 f"WHERE export_date >= '{first_day}' AND outcome = 'expired'")
+    return int(df.iloc[0, 0] or 0) if len(df) else 0
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _aws_pipeline(day):
+    """Spec 3.4 metrics, in the order of _PIPELINE. Anything that cannot be read shows as a dash."""
+    from datetime import timedelta
+    aws, end = _aws(), datetime.now(timezone.utc)
+    stream = _CFG.get("stream", "aml-payments")
+
+    def cw(namespace, metric, dims, stat):
+        pts = aws["cloudwatch"].get_metric_statistics(
+            Namespace=namespace, MetricName=metric, Dimensions=[{"Name": k, "Value": v} for k, v in dims.items()],
+            StartTime=end - timedelta(minutes=10), EndTime=end, Period=60, Statistics=[stat])["Datapoints"]
+        return [p[stat] for p in sorted(pts, key=lambda p: p["Timestamp"])]
+
+    def lag():
+        v = cw("AWS/Kinesis", "GetRecords.IteratorAgeMilliseconds", {"StreamName": stream}, "Maximum")
+        return f"{max(v) / 1000:.1f} s behind (worst of the last 10 minutes)" if v else "No reads in the last 10 minutes"
+
+    def throughput():
+        v = cw("AWS/Kinesis", "IncomingRecords", {"StreamName": stream}, "Sum")
+        return f"{v[-1] / 60:.1f} payments a second (latest minute)" if v else "Nothing arriving"
+
+    def checkpoint():
+        v = cw("AWS/KinesisAnalytics", "lastCheckpointDuration", {"Application": _CFG.get("flink_app", "")}, "Maximum")
+        return f"{v[-1] / 1000:.1f} s" if v else "-"
+
+    def time_to_flag():
+        lag_ms = "date_diff('millisecond', arrived_at, scored_at)"
+        df = _athena(f"SELECT approx_percentile({lag_ms}, 0.5), approx_percentile({lag_ms}, 0.99) "
+                     f"FROM {LIVE_TABLE} WHERE date = '{day}'")
+        if not len(df) or df.iloc[0, 0] is None:
+            return "No payments scored for this day yet"
+        return (f"median {float(df.iloc[0, 0]) / 1000:.2f} s, slowest 1% {float(df.iloc[0, 1]) / 1000:.2f} s "
+                f"(payments dated {day})")
+
+    def retrain():
+        runs = aws["sfn"].list_executions(stateMachineArn=_CFG["q1_state_machine_arn"], statusFilter="SUCCEEDED",
+                                          maxResults=1)["executions"]
+        return f"{(runs[0]['stopDate'] - runs[0]['startDate']).total_seconds() / 60:.0f} min" if runs else "No run yet"
+
+    out = []
+    for fn in (lag, throughput, lambda: "See the Flink dashboard (Managed Flink console)", checkpoint,
+               time_to_flag, retrain):
+        try:
+            out.append(fn())
+        except Exception:
+            out.append("-")
+    return out
+
+
 # =========================================================== backend facade ====
 def now():
-    return _demo().now() if DEMO else time.time()
+    return _demo().now() if DEMO else _sim_now()
 
 
 def load_items():
@@ -295,15 +390,12 @@ def traffic():
     """Payments scored and alerts raised per hour since the live stream started."""
     if DEMO:
         return pd.DataFrame(_demo().traffic, columns=["hour", "payments", "alerts"])
-    df = _athena(f"""
-        SELECT to_unixtime(date_trunc('hour', txn_ts)) AS hour, count(*) AS payments,
-               count_if(score >= threshold) AS alerts
-        FROM {LIVE_TABLE} GROUP BY 1 ORDER BY 1""")
-    return df.astype(float) if len(df) else pd.DataFrame(columns=["hour", "payments", "alerts"])
+    return _aws_traffic(_day(now() - 8 * DAY))
 
 
 def expired_count():
-    return _demo().expired
+    """Alerts and audit items that reached 7 days with no decision."""
+    return _demo().expired if DEMO else _aws_expired(_day(now() - 30 * DAY))
 
 
 _ACT_COLS = ["ts", "direction", "counterparty", "amount", "currency", "format"]
@@ -618,11 +710,6 @@ def customer(it):
             "cp_ours": is_ours(it[f"{other}_bank"])}
 
 
-def _chip(it):
-    p = it.get("priority")
-    return f"<span class='chip c-{esc((p or 'none').lower())}'><i></i>{esc(p or 'Not flagged')}</span>"
-
-
 def _due(it, t):
     left = it["expires_at"] - t
     cls = "last" if left < 6 * 3600 else "soon" if left < DAY else ""
@@ -636,7 +723,6 @@ def _open_sorted(kind, items):
         rows = [it for it in rows if q in it["from_account"].upper() or q in it["to_account"].upper()
                 or q in alert_id(it)]
     order = st.session_state.get(f"sort_{kind}") or SORTS[kind][0]
-    rank = {b: i for i, b in enumerate(BANDS)}
     key = {"Highest risk": lambda it: -it["score"],
            "Oldest first": lambda it: it["created_at"], "Newest first": lambda it: -it["created_at"]}[order]
     return sorted(rows, key=key)
@@ -899,7 +985,7 @@ def _related(it, items):
         return
     rel.sort(key=lambda o: -o["created_at"])
     st.dataframe(pd.DataFrame({
-        "Alert": [alert_id(o) for o in rel], "Priority": [o.get("priority") or "Not flagged" for o in rel],
+        "Alert": [alert_id(o) for o in rel], "Model risk": [fmt_risk(o["score"]) for o in rel],
         "Flagged": [fmt_ts(o["created_at"]) for o in rel],
         "From": [o["from_account"] for o in rel], "To": [o["to_account"] for o in rel],
         "Amount": [o["amount"] for o in rel], "Currency": [o["currency"] for o in rel],
@@ -1080,7 +1166,7 @@ def reviewed():
         "Alert": [alert_id(it) for it in done], "Decision": [OUTCOME[it["status"]] for it in done],
         "Reason": [it.get("reason") or "" for it in done], "Decided": [fmt_ts(it["decided_at"]) for it in done],
         "By": [it["reviewer"] or "-" for it in done],
-        "Priority": [it.get("priority") or "Not flagged" for it in done],
+        "Model risk": [fmt_risk(it["score"]) for it in done],
         "From": [it["from_account"] for it in done], "To": [it["to_account"] for it in done],
         "Amount": [it["amount"] for it in done], "Currency": [it["currency"] for it in done],
         "Comment": [it["note"] or "" for it in done]}),
@@ -1105,7 +1191,7 @@ _PIPELINE = [
     ("Backpressure", "Share of time Flink operators are blocked waiting on a slower step", "Flink dashboard"),
     ("Checkpoint duration", "How long Flink takes to save its state", "CloudWatch, Managed Flink"),
     ("Time to flag", "Median and slowest 1% from a payment arriving to its score being written",
-     "Athena on curated/live/"),
+     "Athena on curated/live/scored/"),
     ("Retrain duration", "How long the last training run took", "Step Functions run history")]
 
 
@@ -1174,14 +1260,14 @@ def metrics():
     c[0].metric("Reviewed, last 7 days", len(done))
     c[1].metric("Alerts marked suspicious", sum(it["status"] == "confirmed" for it in alerts_done))
     c[2].metric("Audit items found suspicious", sum(it["status"] == "confirmed" and it["is_audit"] for it in done))
-    c[3].metric("Expired unreviewed", expired_count() if DEMO else "-",
+    c[3].metric("Expired unreviewed", expired_count(),
                 help="Alerts and audit items that reached 7 days with no decision.")
 
     st.markdown("##### Stream and model pipeline")
     st.dataframe(pd.DataFrame({
         "Metric": [m for m, _, _ in _PIPELINE], "What it tells you": [w for _, w, _ in _PIPELINE],
         "Source": [s for _, _, s in _PIPELINE],
-        "Now": ["Needs the live pipeline" if DEMO else "Not connected yet"] * len(_PIPELINE)}),
+        "Now": ["Needs the live pipeline"] * len(_PIPELINE) if DEMO else _aws_pipeline(_day(t))}),
         hide_index=True, width="stretch", alt="Pipeline health metrics and where each one comes from")
     if DEMO:
         st.caption("The demo replays scored payments from a file, so there is no Kinesis stream or Flink job "
@@ -1229,7 +1315,9 @@ def page_reviewed():
 @st.fragment(run_every="20s")
 def side_clock():
     t = now()
-    st.caption(("Simulated time " if DEMO else "") + fmt_ts(t - t % 3600) + ("" if DEMO else " UTC"))
+    simulated = DEMO or bool(_CLOCK["state"])
+    st.caption(("Simulated time " if simulated else "") + (fmt_ts(t - t % 3600) if DEMO else fmt_ts(t))
+               + ("" if simulated else " UTC"))
 
 
 def main():

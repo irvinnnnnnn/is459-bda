@@ -1,0 +1,84 @@
+{
+  "Comment": "Q2 daily KYC scoring (PIPELINE_SPEC.md 4.6): Glue job, then a transient EMR cluster. Input: {} or {\"run_date\": \"YYYY-MM-DD\"}",
+  "StartAt": "ResolveRunDate",
+  "States": {
+    "ResolveRunDate": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": { "FunctionName": "${resolve_fn}", "Payload.$": "$" },
+      "ResultSelector": { "run_date.$": "$.Payload.run_date" },
+      "Next": "GlueETL"
+    },
+    "GlueETL": {
+      "Type": "Task",
+      "Comment": "Clean, validate, add customer_id and USD -> curated/customer_txns/",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${etl_job}",
+        "Arguments": { "--run_date.$": "$.run_date" }
+      },
+      "ResultPath": null,
+      "Next": "CreateCluster"
+    },
+    "CreateCluster": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::elasticmapreduce:createCluster.sync",
+      "Parameters": {
+        "Name.$": "States.Format('q2-score-{}', $.run_date)",
+        "ReleaseLabel": "${emr_release}",
+        "Applications": [{ "Name": "Spark" }],
+        "ServiceRole": "${emr_service_role}",
+        "JobFlowRole": "${emr_instance_profile}",
+        "LogUri": "s3://${bucket}/logs/emr/",
+        "VisibleToAllUsers": true,
+        "Instances": {
+          "KeepJobFlowAliveWhenNoSteps": true,
+          "Ec2SubnetId": "${subnet}",
+          "InstanceGroups": [
+            { "Name": "master", "InstanceRole": "MASTER", "Market": "ON_DEMAND",
+              "InstanceType": "${instance_type}", "InstanceCount": 1 },
+            { "Name": "core", "InstanceRole": "CORE", "Market": "${core_market}",
+              "InstanceType": "${instance_type}", "InstanceCount": ${core_count} }
+          ]
+        }
+      },
+      "ResultSelector": { "id.$": "$.ClusterId" },
+      "ResultPath": "$.cluster",
+      "Next": "Score"
+    },
+    "Score": {
+      "Type": "Task",
+      "Comment": "Rules, scores, tiers and the queue -> scores/, rule_hits/, rule_eval/",
+      "Resource": "arn:aws:states:::elasticmapreduce:addStep.sync",
+      "Parameters": {
+        "ClusterId.$": "$.cluster.id",
+        "Step": {
+          "Name": "q2-score",
+          "ActionOnFailure": "CONTINUE",
+          "HadoopJarStep": {
+            "Jar": "command-runner.jar",
+            "Args.$": "States.Array('spark-submit', '--deploy-mode', 'cluster', '--py-files', '${py_files}', 's3://${bucket}/code/emr/q2_score.py', '--bucket', '${bucket}', '--our_bank', '${our_bank}', '--run_date', $.run_date, '--struct_threshold_usd', '${struct_threshold}')"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "TerminateAfterFailure" }],
+      "Next": "Terminate"
+    },
+    "Terminate": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::elasticmapreduce:terminateCluster",
+      "Parameters": { "ClusterId.$": "$.cluster.id" },
+      "ResultPath": null,
+      "End": true
+    },
+    "TerminateAfterFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::elasticmapreduce:terminateCluster",
+      "Parameters": { "ClusterId.$": "$.cluster.id" },
+      "ResultPath": null,
+      "Next": "Failed"
+    },
+    "Failed": { "Type": "Fail", "Error": "ScoringFailed", "Cause": "The EMR step failed. See s3://${bucket}/logs/emr/ and the step's stderr." }
+  }
+}

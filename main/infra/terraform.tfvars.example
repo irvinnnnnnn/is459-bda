@@ -1,0 +1,17 @@
+# Copy to terraform.tfvars and change what you need. Every variable has a default (variables.tf),
+# so an empty file works in the Learner Lab.
+
+# bucket_name       = "is459-aml-yourname"   # default: is459-aml-<account id>
+# (our_bank and live_start are not Terraform settings: set them in main/common/settings.json)
+
+# Stress testing: more shards take more payments a second; more parallelism scores them faster.
+# kinesis_shards    = 1
+# flink_parallelism = 1
+
+# Outside the Learner Lab you can use spot core nodes, as the spec describes.
+# emr_use_spot      = false
+
+# The two Streamlit apps run on one EC2 instance, open to anyone who has the address.
+# apps_on_ec2        = true
+# apps_instance_type = "t3.small"
+# apps_allowed_cidr  = "203.0.113.7/32"      # allow one address (or a range) instead of everyone
