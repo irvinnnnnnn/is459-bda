@@ -160,6 +160,9 @@ activemq-data/
 # Environments
 .env
 .envrc
+.env.*
+!.env.example
+!.env.*.example
 .venv
 env/
 venv/
@@ -234,8 +237,17 @@ main/producer/.stress_runs/
 .terraform/
 *.tfstate
 *.tfstate.*
+*.tfplan
+*.plan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
 *.tfvars
 !*.tfvars.example
+.aws/
 
 # dataset files (see data/README.md)
 /data/*

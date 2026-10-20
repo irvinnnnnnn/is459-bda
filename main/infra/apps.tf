@@ -28,9 +28,15 @@ variable "apps_allowed_cidr" {
 }
 
 variable "apps_instance_profile" {
-  description = "Instance profile that lets the apps read DynamoDB, Athena and S3. The Learner Lab provides LabInstanceProfile."
+  description = "EC2 instance profile used by the Streamlit apps."
   type        = string
   default     = "LabInstanceProfile"
+}
+
+variable "create_apps_instance_profile" {
+  description = "Create the app EC2 instance profile around role_name. Set false if this profile already exists."
+  type        = bool
+  default     = true
 }
 
 data "aws_vpc" "default" {

@@ -11,7 +11,7 @@ variable "bucket_name" {
 }
 
 variable "role_name" {
-  description = "IAM role every service runs as. The Learner Lab cannot create roles, so everything uses LabRole."
+  description = "Shared IAM execution role for the pipeline services and optional app EC2 instance."
   type        = string
   default     = "LabRole"
 }
