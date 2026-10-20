@@ -1,0 +1,18 @@
+[
+  {
+    "PropertyGroupId": "app",
+    "PropertyMap": {
+      "bucket": "REPLACE_WITH_BUCKET",
+      "stream.name": "aml-payments",
+      "aws.region": "us-east-1",
+      "our.bank": "11",
+      "alerts.table": "aml-q1-alerts",
+      "audit.rate": "0.003",
+      "init.position": "LATEST",
+      "seed.path": "",
+      "flush.seconds": "30",
+      "flush.rows": "5000",
+      "sink.buckets": "4"
+    }
+  }
+]

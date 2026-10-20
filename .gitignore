@@ -226,3 +226,18 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# pipeline build output, local config and Terraform state (main/)
+main/config.json
+main/producer/data/
+main/producer/.stress_runs/
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+!*.tfvars.example
+
+# dataset files (see data/README.md)
+/data/*
+!/data/fx_rates.csv
+!/data/README.md

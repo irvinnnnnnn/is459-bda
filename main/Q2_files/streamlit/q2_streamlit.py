@@ -16,15 +16,29 @@ depend on analyst decisions: the DynamoDB decisions table, and the end of the ni
 (R12, tiers, in_queue, queue_reason). "Run the next night" on the Overview page runs that job for
 the next date using the decisions made in the app.
 
-AWS mode is not wired up yet. Each backend function names the store it would read:
-  queue, scores, rule hits, rule precision   Athena on scores/, rule_hits/, rule_eval/
-  customer transactions                      Athena on curated/customer_txns/
-  claims and decisions                       DynamoDB decisions (conditional writes)
+Against AWS (after terraform apply, which writes main/config.json with the resource names):
+    set Q2_MODE=aws            (Mac/Linux: export Q2_MODE=aws)
+    streamlit run q2_streamlit.py
+
+Where each thing comes from against AWS (spec 4.3: the app reads through Athena and writes decisions
+straight to S3):
+  queue, scores, rules fired, rule precision   Athena on scores/ (written by the nightly EMR job)
+  customer transactions                        Athena on curated/customer_txns/, on demand
+  claims and decisions                         events in decisions/, one small Parquet file each, written
+                                               by this app and read back through Athena
+Decision times come from the producer's simulated clock (state/sim_clock.json) when a replay is
+running, so they line up with the payments on screen.
 """
 import html
+import io
 import json
 import math
+import os
+import re
 import threading
+import time
+import uuid
+from collections.abc import Mapping
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -32,6 +46,14 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
+DEMO = os.getenv("Q2_MODE", "demo").strip().lower() != "aws"
+_CFG_FILE = Path(__file__).resolve().parents[2] / "config.json"     # written by terraform apply
+_CFG = json.loads(_CFG_FILE.read_text()) if _CFG_FILE.exists() else {}
+REGION = os.getenv("AWS_REGION", _CFG.get("region", "us-east-1"))
+S3_BUCKET = os.getenv("S3_BUCKET", _CFG.get("bucket", ""))
+BANK_ID = str(int(os.getenv("BANK_ID", _CFG.get("our_bank", "11"))))
+ATHENA_DB = os.getenv("ATHENA_DB", _CFG.get("athena_db", "aml"))
+ATHENA_WG = os.getenv("ATHENA_WORKGROUP", _CFG.get("athena_workgroup", "primary"))
 SNAPSHOT = Path(__file__).parent / "demo_snapshot.json"
 HIGH_PCT, MEDIUM_PCT = 0.01, 0.10            # tiers: top 1% High, next 9% Medium (spec 4.4)
 SCORE_JUMP = 20                              # a cleared customer returns if the score rises this much (4.5)
@@ -169,7 +191,294 @@ def _demo_for(version):
     return _Demo()
 
 
+# =============================================================== AWS backend ====
+RULES = {   # rule_id: (name, points, what it looks for, MAS grounding). The EMR job owns the logic.
+    "R1": ("Rapid pass-through", 25, "Money received is sent on again within two days",
+           "Assets withdrawn immediately after deposit without business reason"),
+    "R2": ("Round trip", 20, "Money paid to a counterparty comes back from the same counterparty",
+           "U-turn transactions"),
+    "R3": ("Collection from many senders", 15, "Unusually many different senders pay the customer",
+           "Payments to a single account from many different people without explanation"),
+    "R4": ("Gather and scatter", 15, "Money collected from many senders is passed on to many recipients",
+           "Scam money-mule pattern"),
+    "R5": ("Dispersal to many recipients", 10, "The customer pays unusually many different recipients",
+           "Unusual destination of funds (layering)"),
+    "R6": ("Structuring below the threshold", 20, "Several payments sit just under the reporting threshold",
+           "Splitting to avoid reporting or CDD thresholds"),
+    "R7": ("Activity out of line with profile", 15, "Value moved is far above the customer's own recent level, or its peers'",
+           "Activity inconsistent with the customer's profile"),
+    "R8": ("Cash or crypto concentration", 10, "Most of the value moved is cash or Bitcoin",
+           "Cash-heavy activity; digital-asset risk"),
+    "R9": ("New-counterparty burst", 10, "Most recent counterparties are new to the customer",
+           "Proxy for mule onboarding or newly active accounts"),
+    "R10": ("Own-account shuffling", 10, "Repeated large transfers between the customer's own accounts",
+            "Movement across multiple accounts without clear purpose"),
+    "R11": ("Currency churn", 10, "A large share of value is converted between currencies",
+            "Layering through conversion"),
+    "R12": ("Linked to customers needing EDD", 15, "Transacted with a customer an analyst marked as needing EDD",
+            "Dealings with parties already assessed as higher risk"),
+}
+
+
+def _athena(sql):
+    ath = _aws().athena
+    qid = ath.start_query_execution(QueryString=sql, QueryExecutionContext={"Database": ATHENA_DB},
+                                    WorkGroup=ATHENA_WG)["QueryExecutionId"]
+    while True:
+        q = ath.get_query_execution(QueryExecutionId=qid)["QueryExecution"]["Status"]
+        if q["State"] in ("SUCCEEDED", "FAILED", "CANCELLED"):
+            break
+        time.sleep(0.3)
+    if q["State"] != "SUCCEEDED":
+        raise RuntimeError(f"Athena query {q['State'].lower()}: {q.get('StateChangeReason', '')}")
+    rows = []
+    for page in ath.get_paginator("get_query_results").paginate(QueryExecutionId=qid):
+        rows += [[c.get("VarCharValue") for c in r["Data"]] for r in page["ResultSet"]["Rows"]]
+    return pd.DataFrame(rows[1:], columns=rows[0]) if rows else pd.DataFrame()
+
+
+def _num(v):
+    return None if v is None or v == "" else float(v)
+
+
+class _Scores(dict):
+    """scores/ by run date, loaded through Athena the first time a run is asked for."""
+
+    def __init__(self, backend):
+        super().__init__()
+        self.backend = backend
+
+    def __missing__(self, run):
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", run):
+            raise KeyError(run)
+        df = _athena(f"SELECT * FROM scores WHERE run_date = '{run}'")
+        rows = {}
+        for r in df.to_dict("records"):
+            rows[r["customer_id"]] = {
+                "id": r["customer_id"], "type": r["entity_type"], "n_accounts": int(r["n_accounts"] or 0),
+                "accounts": json.loads(r["accounts"] or "[]"), "points": int(r["points"] or 0),
+                "peer": float(r["peer"] or 0), "score": float(r["score"] or 0), "tier": r["tier"],
+                "hits": [[h["rule"], h["evidence"]] for h in json.loads(r["hits"] or "[]")],
+                "rules": json.loads(r["rules"] or "[]"), "m": json.loads(r["metrics"] or "{}"),
+                "l": int(r["laundering"] or 0), "in_queue": r["in_queue"] == "true",
+                "queue_reason": r["queue_reason"] or "", "prev_score": _num(r["prev_score"]),
+                "change": _num(r["change"]), "new_rules": json.loads(r["new_rules"] or "[]"),
+                "window_start": r["window_start"]}
+        self[run] = rows
+        return rows
+
+
+class _Accounts(Mapping):
+    """Customer -> the accounts it used in the latest window. Its keys are "our customers"."""
+
+    def __init__(self, backend):
+        self.backend = backend
+
+    def _rows(self):
+        return self.backend.out[self.backend.run]
+
+    def __getitem__(self, cid):
+        return self._rows()[cid]["accounts"]
+
+    def __iter__(self):
+        return iter(self._rows())
+
+    def __len__(self):
+        return len(self._rows())
+
+
+class _Windows(Mapping):
+    def __init__(self, backend):
+        self.backend = backend
+
+    def __getitem__(self, run):
+        rows = self.backend.out[run]
+        first = next(iter(rows.values()), None)
+        return {"window_start": first["window_start"] if first else day_after(run, -6)}
+
+    def __iter__(self):
+        return iter(self.backend.runs)
+
+    def __len__(self):
+        return len(self.backend.runs)
+
+
+class _Aws:
+    """Same interface as _Demo, backed by the pipeline's stores."""
+
+    def __init__(self):
+        import boto3
+        session = boto3.Session(region_name=REGION)
+        self.s3, self.athena = session.client("s3"), session.client("athena")
+        self.rules = {k: list(v) for k, v in RULES.items()}
+        self.lock = threading.Lock()
+        self.out = _Scores(self)
+        self.snap = {"accounts": _Accounts(self), "runs": _Windows(self)}
+        self._runs, self._runs_at, self._events, self._events_at, self._clock = [], 0.0, None, 0.0, (0.0, None)
+
+    # ---- nightly runs: the run_date folders the EMR job has written
+    @property
+    def runs(self):
+        if time.time() - self._runs_at > 60:
+            found, kw = [], {"Bucket": S3_BUCKET, "Prefix": "scores/run_date=", "Delimiter": "/"}
+            while True:
+                r = self.s3.list_objects_v2(**kw)
+                found += [p["Prefix"].rstrip("/").split("=", 1)[1] for p in r.get("CommonPrefixes", [])]
+                if not r.get("IsTruncated"):
+                    break
+                kw["ContinuationToken"] = r["NextContinuationToken"]
+            self._runs, self._runs_at = sorted(found), time.time()
+        return self._runs
+
+    @property
+    def i(self):
+        return len(self.runs) - 1
+
+    @property
+    def run(self):
+        return self.runs[-1]
+
+    @property
+    def today(self):
+        return day_after(self.run)          # analysts work the day after the nightly run
+
+    def now(self):
+        """The producer's simulated clock, or the real time when no replay is running."""
+        read_at, state = self._clock
+        if time.time() - read_at > 5:
+            try:
+                state = json.loads(self.s3.get_object(Bucket=S3_BUCKET, Key="state/sim_clock.json")["Body"].read())
+            except Exception:
+                state = None
+            self._clock = (time.time(), state)
+        if not state:
+            return time.time()
+        if not state.get("running"):
+            return float(state["sim_anchor"])
+        return float(state["sim_anchor"]) + (time.time() - float(state["wall_anchor"])) * float(state["speed"])
+
+    # ---- decisions/: an append-only event log; current state = the latest events per customer
+    def _load_events(self, fresh=False):
+        if fresh or self._events is None or time.time() - self._events_at > 30:
+            first = day_after(self.runs[0], -120) if self.runs else "2000-01-01"
+            df = _athena(f"""SELECT customer_id, event, analyst, to_unixtime(at) AS at, cleared_until, note,
+                                    snapshot_score, snapshot_rules, run_date, to_unixtime(written_at) AS written_at
+                             FROM decisions WHERE date >= '{first}'""")
+            self._events, self._events_at = df.to_dict("records"), time.time()
+        return self._events
+
+    @property
+    def decisions(self):
+        decided, claimed = {}, {}
+        for e in sorted(self._load_events(), key=lambda e: (float(e["at"]), float(e["written_at"] or 0))):
+            cid = e["customer_id"]
+            base = {"analyst": e["analyst"], "run": e["run_date"],
+                    "at": datetime.fromtimestamp(float(e["at"]), timezone.utc).strftime("%Y-%m-%d")}
+            if e["event"] in ("edd_needed", "cleared"):
+                decided[cid] = {**base, "decision": e["event"], "note": e["note"] or "",
+                                "cleared_until": e["cleared_until"] or None,
+                                "snapshot": {"score": float(e["snapshot_score"] or 0),
+                                             "rules": json.loads(e["snapshot_rules"] or "[]")}}
+                claimed.pop(cid, None)
+            elif e["event"] == "reopened":
+                decided.pop(cid, None)
+                claimed.pop(cid, None)
+            elif e["event"] == "claimed":
+                claimed[cid] = base
+            elif e["event"] == "released":
+                claimed.pop(cid, None)
+        state = dict(decided)
+        for cid, c in claimed.items():
+            state[cid] = {**c, "decision": "claimed", "previous": decided.get(cid)}
+        return state
+
+    def _write(self, cid, event, analyst, cleared_until=None, note="", snapshot=None):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+        now, wall = self.now(), time.time()
+        row = {"customer_id": cid, "event": event, "analyst": analyst, "at": int(now * 1000),
+               "cleared_until": cleared_until, "note": note or "",
+               "snapshot_score": snapshot["score"] if snapshot else None,
+               "snapshot_rules": json.dumps(snapshot["rules"]) if snapshot else None,
+               "run_date": self.run, "written_at": int(wall * 1000)}
+        schema = pa.schema([("customer_id", pa.string()), ("event", pa.string()), ("analyst", pa.string()),
+                            ("at", pa.timestamp("ms")), ("cleared_until", pa.string()), ("note", pa.string()),
+                            ("snapshot_score", pa.float64()), ("snapshot_rules", pa.string()),
+                            ("run_date", pa.string()), ("written_at", pa.timestamp("ms"))])
+        buf = io.BytesIO()
+        pq.write_table(pa.Table.from_pylist([row], schema=schema), buf)
+        day = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
+        self.s3.put_object(Bucket=S3_BUCKET, Body=buf.getvalue(),
+                           Key=f"decisions/date={day}/{int(wall * 1000)}-{uuid.uuid4().hex[:8]}.parquet")
+        if self._events is not None:        # show our own write at once; others' arrive with the next read
+            self._events.append({**row, "at": now, "written_at": wall})
+
+    def _held_by_other(self, cid, analyst):
+        """Re-read the log before a write; refuse if another analyst holds an open claim (spec 4.3)."""
+        self._load_events(fresh=True)
+        d = self.decisions.get(cid)
+        return d["analyst"] if d and d["decision"] == "claimed" and d["analyst"] != analyst else None
+
+    def claim(self, cid, analyst):
+        other = self._held_by_other(cid, analyst)
+        if other:
+            return False, f"Already in review by {other}."
+        self._write(cid, "claimed", analyst)
+        return True, ""
+
+    def release(self, cid, analyst):
+        d = self.decisions.get(cid)
+        if d and d["decision"] == "claimed" and d["analyst"] == analyst:
+            self._write(cid, "released", analyst)
+
+    def decide(self, cid, decision, analyst, note, days=None):
+        other = self._held_by_other(cid, analyst)
+        if other:
+            return False, f"In review by {other}. Only they can record the decision."
+        row = self.out[self.run][cid]
+        self._write(cid, decision, analyst, note=note,
+                    cleared_until=day_after(self.today, days) if decision == "cleared" else None,
+                    snapshot={"score": row["score"], "rules": list(row["rules"])})
+        return True, ""
+
+    def reopen(self, cid, analyst):
+        self._write(cid, "reopened", analyst)
+
+    def next_night(self):                   # the nightly run is the Step Functions workflow, not a button
+        return False
+
+    def reset(self):
+        pass
+
+    def txns(self, cid, start, run):
+        """Athena, on demand: one customer's payments from curated/customer_txns/, both sides."""
+        if not re.fullmatch(r"[0-9A-Za-z_-]+", cid):
+            raise ValueError("Unexpected customer id")
+        side = """SELECT to_unixtime(txn_ts) AS ts, {me}_account AS account, '{d}' AS direction,
+                         {cp}_customer_id AS cp_entity, {cp}_bank AS cp_bank, {cp}_account AS cp_account,
+                         {amt}_usd AS amount, {amt} AS orig_amount, {cur} AS currency, payment_format AS format,
+                         CASE WHEN from_customer_id = to_customer_id THEN 1 ELSE 0 END AS internal
+                  FROM customer_txns
+                  WHERE date BETWEEN '{start}' AND '{run}' AND {me}_customer_id = '{cid}' AND {me}_bank = '{bank}'"""
+        df = _athena(side.format(me="from", cp="to", d="out", amt="amount_paid", cur="payment_currency",
+                                 start=start, run=run, cid=cid, bank=BANK_ID)
+                     + " UNION ALL "
+                     + side.format(me="to", cp="from", d="in", amt="amount_received", cur="receiving_currency",
+                                   start=start, run=run, cid=cid, bank=BANK_ID))
+        if not len(df):
+            return df
+        return df.astype({"ts": float, "amount": float, "orig_amount": float, "internal": int})
+
+
+@st.cache_resource
+def _aws():
+    return _Aws()
+
+
 def demo():
+    """The backend: the snapshot player in demo mode, the pipeline's stores against AWS."""
+    if not DEMO:
+        return _aws()
     return _demo_for((SNAPSHOT.stat().st_mtime, Path(__file__).stat().st_mtime))
 
 
@@ -206,9 +515,17 @@ def customer_txns(cid, run=None):
     start = d.snap["runs"][run]["window_start"]
     cols = ["ts", "account", "direction", "cp_entity", "cp_bank", "cp_account", "amount", "orig_amount",
             "currency", "format", "internal"]
+    if not DEMO:
+        df = _aws_txns(cid, start, run)
+        return df if len(df) else pd.DataFrame(columns=cols)
     df = pd.DataFrame(d.snap["txns"].get(cid, []), columns=cols)
     day = pd.to_datetime(df.ts, unit="s").dt.strftime("%Y-%m-%d")
     return df[(day >= start) & (day <= run)]
+
+
+@st.cache_data(ttl=600, show_spinner="Loading the customer's transactions")
+def _aws_txns(cid, start, run):
+    return _aws().txns(cid, start, run)
 
 
 def history(cid):
@@ -840,6 +1157,9 @@ def page_overview():
         col.metric(f"{p['tier']} tier involved in laundering",
                    "-" if p["precision"] is None else f"{p['precision']:.0%}", help=f"{p['customers']:,} customers")
 
+    if not DEMO:
+        st.caption("The next nightly run rebuilds the queue from new scores and the decisions recorded so far.")
+        return
     st.markdown("##### Demo")
     a, b, c2 = st.columns([3, 1.3, 1.3], vertical_alignment="center")
     last = demo().i >= len(demo().runs) - 1
@@ -855,9 +1175,19 @@ def page_overview():
 def main():
     st.set_page_config(page_title="KYC review queue", page_icon=":material/verified_user:", layout="wide")
     st.html(CSS)
-    if not SNAPSHOT.exists():
+    if DEMO and not SNAPSHOT.exists():
         st.error("demo_snapshot.json is missing. Build it with: python build_demo_snapshot.py")
         return
+    if not DEMO:
+        try:
+            ready = bool(demo().runs)
+        except Exception as exc:
+            st.error(f"Could not reach AWS: {exc}")
+            return
+        if not ready:
+            st.info("No nightly run has finished yet. Start one with: python main/scripts/pipeline.py q2 "
+                    "(or run the producer with --q2 async).")
+            return
     pages = {"Queue": st.Page(page_queue, title="Priority queue", icon=":material/format_list_numbered:",
                               url_path="queue", default=True),
              "Reviewed": st.Page(page_reviewed, title="Reviewed", icon=":material/task_alt:", url_path="reviewed"),
@@ -868,7 +1198,7 @@ def main():
         st.switch_page(pages[goto])
     with st.sidebar:
         with st.container(key="side_bottom"):
-            st.text_input("Analyst", key="analyst", value="Demo analyst",
+            st.text_input("Analyst", key="analyst", value="Demo analyst" if DEMO else "",
                           help="Recorded with every claim and decision you make.")
             st.caption(f"Scores from the night of {fmt_day(run_date())}")
     page.run()

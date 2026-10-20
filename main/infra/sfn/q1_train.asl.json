@@ -1,0 +1,147 @@
+{
+  "Comment": "Q1 train and promote (PIPELINE_SPEC.md 3.2). One workflow for the initial run and every retrain. Input: {}",
+  "StartAt": "Init",
+  "States": {
+    "Init": {
+      "Type": "Pass",
+      "Comment": "run_id = start date + the first part of the execution name, e.g. 2026-10-13-ab12cd34",
+      "Parameters": {
+        "run_id.$": "States.Format('{}-{}', States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 0), States.ArrayGetItem(States.StringSplit($$.Execution.Name, '-'), 0))"
+      },
+      "Next": "BuildTrainingSet"
+    },
+    "BuildTrainingSet": {
+      "Type": "Task",
+      "Comment": "Glue: labels joined to Flink's logged features, plus history, rolling window, 60/20/20 split by time",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName": "${build_job}",
+        "Arguments": { "--run_id.$": "$.run_id" }
+      },
+      "ResultPath": null,
+      "Next": "Train"
+    },
+    "Train": {
+      "Type": "Task",
+      "Comment": "SageMaker training: reads train/ and val/ only",
+      "Resource": "arn:aws:states:::sagemaker:createTrainingJob.sync",
+      "Parameters": {
+        "TrainingJobName.$": "States.Format('q1-train-{}', $.run_id)",
+        "RoleArn": "${role_arn}",
+        "AlgorithmSpecification": { "TrainingImage": "${image}", "TrainingInputMode": "File" },
+        "HyperParameters": {
+          "sagemaker_program": "\"train.py\"",
+          "sagemaker_submit_directory": "\"s3://${bucket}/code/sagemaker/train.tar.gz\"",
+          "bucket": "\"${bucket}\"",
+          "bank": "\"${our_bank}\"",
+          "run_id.$": "States.Format('\"{}\"', $.run_id)"
+        },
+        "InputDataConfig": [
+          {
+            "ChannelName": "train",
+            "ContentType": "application/x-parquet",
+            "DataSource": { "S3DataSource": { "S3DataType": "S3Prefix", "S3DataDistributionType": "FullyReplicated",
+              "S3Uri.$": "States.Format('s3://${bucket}/training/run={}/train/', $.run_id)" } }
+          },
+          {
+            "ChannelName": "val",
+            "ContentType": "application/x-parquet",
+            "DataSource": { "S3DataSource": { "S3DataType": "S3Prefix", "S3DataDistributionType": "FullyReplicated",
+              "S3Uri.$": "States.Format('s3://${bucket}/training/run={}/val/', $.run_id)" } }
+          }
+        ],
+        "OutputDataConfig": { "S3OutputPath.$": "States.Format('s3://${bucket}/models/artifacts/run={}/', $.run_id)" },
+        "ResourceConfig": { "InstanceType": "${instance}", "InstanceCount": 1, "VolumeSizeInGB": 10 },
+        "StoppingCondition": { "MaxRuntimeInSeconds": 3600 }
+      },
+      "ResultSelector": { "model_data.$": "$.ModelArtifacts.S3ModelArtifacts" },
+      "ResultPath": "$.train",
+      "Next": "Evaluate"
+    },
+    "Evaluate": {
+      "Type": "Task",
+      "Comment": "SageMaker Processing: champion vs challenger on the same test split",
+      "Resource": "arn:aws:states:::sagemaker:createProcessingJob.sync",
+      "Parameters": {
+        "ProcessingJobName.$": "States.Format('q1-eval-{}', $.run_id)",
+        "RoleArn": "${role_arn}",
+        "AppSpecification": {
+          "ImageUri": "${image}",
+          "ContainerEntrypoint": ["python3", "/opt/ml/processing/code/evaluate.py"],
+          "ContainerArguments.$": "States.Array('--bucket', '${bucket}', '--run_id', $.run_id, '--bank', '${our_bank}')"
+        },
+        "ProcessingInputs": [
+          {
+            "InputName": "code",
+            "S3Input": { "S3Uri": "s3://${bucket}/code/sagemaker/evaluate/", "LocalPath": "/opt/ml/processing/code",
+              "S3DataType": "S3Prefix", "S3InputMode": "File" }
+          },
+          {
+            "InputName": "test",
+            "S3Input": { "S3Uri.$": "States.Format('s3://${bucket}/training/run={}/test/', $.run_id)",
+              "LocalPath": "/opt/ml/processing/test", "S3DataType": "S3Prefix", "S3InputMode": "File" }
+          }
+        ],
+        "ProcessingResources": { "ClusterConfig": { "InstanceCount": 1, "InstanceType": "${instance}", "VolumeSizeInGB": 10 } },
+        "StoppingCondition": { "MaxRuntimeInSeconds": 1800 }
+      },
+      "ResultPath": null,
+      "Next": "ReadEvaluation"
+    },
+    "ReadEvaluation": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+      "Parameters": {
+        "Bucket": "${bucket}",
+        "Key.$": "States.Format('models/artifacts/run={}/evaluation.json', $.run_id)"
+      },
+      "ResultSelector": { "result.$": "States.StringToJson($.Body)" },
+      "ResultPath": "$.evaluation",
+      "Next": "Better"
+    },
+    "Better": {
+      "Type": "Choice",
+      "Comment": "better? no -> keep the champion",
+      "Choices": [{ "Variable": "$.evaluation.result.promote", "BooleanEquals": true, "Next": "Register" }],
+      "Default": "KeepChampion"
+    },
+    "KeepChampion": { "Type": "Succeed" },
+    "Register": {
+      "Type": "Task",
+      "Comment": "SageMaker Model Registry: artifact path, training data path, metrics, approval status",
+      "Resource": "arn:aws:states:::aws-sdk:sagemaker:createModelPackage",
+      "Parameters": {
+        "ModelPackageGroupName": "${model_group}",
+        "ModelApprovalStatus": "Approved",
+        "ModelPackageDescription.$": "$.evaluation.result.reason",
+        "InferenceSpecification": {
+          "Containers": [{ "Image": "${image}", "ModelDataUrl.$": "$.train.model_data" }],
+          "SupportedContentTypes": ["text/csv"],
+          "SupportedResponseMIMETypes": ["text/csv"]
+        },
+        "CustomerMetadataProperties": {
+          "artifact_path.$": "States.Format('s3://${bucket}/models/artifacts/run={}/', $.run_id)",
+          "training_data_path.$": "States.Format('s3://${bucket}/training/run={}/', $.run_id)",
+          "pr_auc.$": "States.Format('{}', $.evaluation.result.challenger.pr_auc)",
+          "recall_at_budget.$": "States.Format('{}', $.evaluation.result.challenger.recall_at_budget)"
+        }
+      },
+      "ResultSelector": { "model_package_arn.$": "$.ModelPackageArn" },
+      "ResultPath": "$.registered",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.registry_error", "Next": "Promote" }],
+      "Next": "Promote"
+    },
+    "Promote": {
+      "Type": "Task",
+      "Comment": "On approval: update the pointer. Flink polls it and hot-reloads the model.",
+      "Resource": "arn:aws:states:::aws-sdk:s3:copyObject",
+      "Parameters": {
+        "Bucket": "${bucket}",
+        "CopySource.$": "States.Format('${bucket}/models/artifacts/run={}/manifest.json', $.run_id)",
+        "Key": "models/best/manifest.json"
+      },
+      "ResultPath": null,
+      "End": true
+    }
+  }
+}
