@@ -16,6 +16,12 @@ variable "role_name" {
   default     = "LabRole"
 }
 
+variable "manage_iam_resources" {
+  description = "Create the project IAM role, policies and instance profiles. Set false in Learner Lab to use its pre-created roles."
+  type        = bool
+  default     = true
+}
+
 # ---- Q1 streaming
 variable "kinesis_shards" {
   description = "Shards in the transaction stream. One shard takes 1,000 records or 1 MB a second."

@@ -1,7 +1,8 @@
 # One shared execution role is used by the pipeline services and (optionally) the app EC2
 # instance, matching the repository's role_name setting.
 resource "aws_iam_role" "pipeline" {
-  name = var.role_name
+  count = var.manage_iam_resources ? 1 : 0
+  name  = var.role_name
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -23,8 +24,9 @@ resource "aws_iam_role" "pipeline" {
 }
 
 resource "aws_iam_role_policy" "pipeline" {
-  name = "is459-aml-runtime"
-  role = aws_iam_role.pipeline.id
+  count = var.manage_iam_resources ? 1 : 0
+  name  = "is459-aml-runtime"
+  role  = aws_iam_role.pipeline[0].id
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -128,15 +130,16 @@ resource "aws_iam_role_policy" "pipeline" {
 }
 
 resource "aws_iam_instance_profile" "apps" {
-  count = var.apps_on_ec2 && var.create_apps_instance_profile ? 1 : 0
+  count = var.manage_iam_resources && var.apps_on_ec2 && var.create_apps_instance_profile ? 1 : 0
   name  = var.apps_instance_profile
-  role  = aws_iam_role.pipeline.name
+  role  = aws_iam_role.pipeline[0].name
 }
 
 # Q2 EMR uses a service role to create/manage the cluster, and a separate EC2 instance
 # profile for the Spark machines. The latter is limited to this project's S3 bucket.
 resource "aws_iam_role" "emr_service" {
-  name = var.emr_service_role
+  count = var.manage_iam_resources ? 1 : 0
+  name  = var.emr_service_role
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -149,12 +152,14 @@ resource "aws_iam_role" "emr_service" {
 }
 
 resource "aws_iam_role_policy_attachment" "emr_service" {
-  role       = aws_iam_role.emr_service.name
+  count      = var.manage_iam_resources ? 1 : 0
+  role       = aws_iam_role.emr_service[0].name
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonElasticMapReduceRole"
 }
 
 resource "aws_iam_role" "emr_ec2" {
-  name = var.emr_instance_profile
+  count = var.manage_iam_resources ? 1 : 0
+  name  = var.emr_instance_profile
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -167,8 +172,9 @@ resource "aws_iam_role" "emr_ec2" {
 }
 
 resource "aws_iam_role_policy" "emr_ec2" {
-  name = "is459-aml-emr-data"
-  role = aws_iam_role.emr_ec2.id
+  count = var.manage_iam_resources ? 1 : 0
+  name  = "is459-aml-emr-data"
+  role  = aws_iam_role.emr_ec2[0].id
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -190,6 +196,42 @@ resource "aws_iam_role_policy" "emr_ec2" {
 }
 
 resource "aws_iam_instance_profile" "emr_ec2" {
-  name = var.emr_instance_profile
-  role = aws_iam_role.emr_ec2.name
+  count = var.manage_iam_resources ? 1 : 0
+  name  = var.emr_instance_profile
+  role  = aws_iam_role.emr_ec2[0].name
+}
+
+moved {
+  from = aws_iam_role.pipeline
+  to   = aws_iam_role.pipeline[0]
+}
+
+moved {
+  from = aws_iam_role_policy.pipeline
+  to   = aws_iam_role_policy.pipeline[0]
+}
+
+moved {
+  from = aws_iam_role.emr_service
+  to   = aws_iam_role.emr_service[0]
+}
+
+moved {
+  from = aws_iam_role_policy_attachment.emr_service
+  to   = aws_iam_role_policy_attachment.emr_service[0]
+}
+
+moved {
+  from = aws_iam_role.emr_ec2
+  to   = aws_iam_role.emr_ec2[0]
+}
+
+moved {
+  from = aws_iam_role_policy.emr_ec2
+  to   = aws_iam_role_policy.emr_ec2[0]
+}
+
+moved {
+  from = aws_iam_instance_profile.emr_ec2
+  to   = aws_iam_instance_profile.emr_ec2[0]
 }
