@@ -80,7 +80,7 @@ The dataset is not in git. Download `HI-Small_Trans.csv` and `HI-Small_accounts.
 
 ```
 python main/producer/producer.py prepare --csv data/HI-Small_Trans.csv
-python main/producer/producer.py fx                    # only if you have no data/fx_rates.csv; needs: pip install yfinance
+python main/producer/producer.py fx                    # only if you have no data/fx_rates.csv
 python main/producer/producer.py upload --accounts data/HI-Small_accounts.csv --fx data/fx_rates.csv
 python main/scripts/pipeline.py setup
 ```
@@ -88,8 +88,8 @@ python main/scripts/pipeline.py setup
 | Command | What it does | How long |
 |---|---|---|
 | `prepare` | Splits the dataset: days before 8 Sep 2022 are history for training, later days are replayed live | 1 minute |
-| `fx` | Downloads exchange rates for the dataset's dates into `data/fx_rates.csv` | 1 minute |
-| `upload` | Sends the history, the customer list and the exchange rates to AWS | 1 minute |
+| `fx` | Downloads exchange rates for the dataset's dates (Frankfurter API: central-bank rates, Bitcoin from the Swiss tax administration) into `data/fx_rates.csv`. Days with no published rate take the last one before (`source` = `frankfurter-carried`) | 1 minute |
+| `upload` | Sends the history, the customer list and the history days' exchange rates to AWS. Each live day's rates are sent by `replay` as that simulated day starts | 1 minute |
 | `setup` | Trains the first model | 20 minutes |
 
 Setup is done. You only repeat it after a `terraform destroy`.
@@ -313,7 +313,6 @@ It prints the dates covered and suggests a `live_start`. Then:
 2. Run `prepare` on the new file.
 3. Fetch exchange rates for the new dates. A rates file made for HI-Small only covers September 2022. This replaces `data/fx_rates.csv`:
    ```
-   pip install yfinance
    python main/producer/producer.py fx
    ```
 4. Run `upload` with the new accounts file and `--fx data/fx_rates.csv`, then `terraform apply` and `pipeline.py setup`.

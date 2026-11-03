@@ -71,7 +71,7 @@ One S3 bucket, `s3://is459-aml-project/`, with separate prefixes:
 | `training/run=<date>/train/`, `val/`, `test/` | Q1 | training Glue job | Training snapshot for one run |
 | `models/artifacts/run=<date>/` | Q1 | SageMaker training | Model artifact |
 | `models/best/manifest.json` | Q1 | promotion step | Pointer to the approved artifact |
-| `raw/accounts/`, `raw/fx/` | Q2 | daily uploads | Accounts + FX CSVs, as received |
+| `raw/accounts/`, `raw/fx/` | Q2 | daily uploads | Accounts + FX CSVs, as received (`raw/fx/date=<day>/fx.csv`: one file per day) |
 | `curated/customer_txns/` | Q2 | Q2 Glue job | Cleaned transactions + `customer_id` + USD amount (Parquet, partitioned by date) |
 | `decisions/` | Q2 | Streamlit (directly) | Append-only analyst events (§4.3): claims, releases, decisions, reopens. Partitioned by date |
 | `scores/run_date=<date>/` | Q2 | EMR | One row per customer: score, tier, rules fired, evidence, `in_queue`, `queue_reason` |
@@ -96,7 +96,7 @@ Diagrams show the real-world entity, with a red dashed "DEMO" box saying what si
 | Core banking / payment system (transaction events) | `producer.py` replays HI-Large in event-time order into Kinesis |
 | Bank's labelled case history | IBM AML HI-Large (synthetic, complete labels) |
 | Customer master DB (core banking / KYC) | `accounts.csv` (IBM dataset) uploaded straight to `raw/accounts/` |
-| yfinance FX rates API | FX CSV pre-fetched via yfinance, uploaded to `raw/fx/` |
+| Daily FX rates feed | Rates pre-fetched from the Frankfurter API, sent to `raw/fx/` one day at a time |
 
 AML investigators and KYC analysts are real Streamlit users in the design. A demo may simulate their decisions using the dataset's hidden labels; that is not drawn on the diagrams.
 
@@ -283,7 +283,7 @@ Flink backpressure: Flink dashboard only, no alarm.
 ```
 NIGHT (automatic, daily) — EventBridge → Step Functions:
   Customer master DB ─(daily export)─▶ raw/accounts/ ─┐
-  yfinance FX ───────(daily fetch)──▶ raw/fx/ ───────┤
+  FX (Frankfurter) ─────(daily)─▶ raw/fx/ ───────────┤
   raw/transactions/ (Q1 Firehose) + curated/historical/ (Q1) ──┴─▶ Glue job → curated/customer_txns/
      → Transient EMR (reads customer_txns + decisions/) → scores/, rule_hits/, rule_eval/
 
@@ -303,11 +303,10 @@ The nightly loop answers "who looks risky?". The daytime loop records "we've dea
 
 **Reference data (CSV)**
 - `raw/accounts/`: account → customer mapping, from the customer master DB.
-- `raw/fx/`: daily FX rates from yfinance, plus a one-off historical backfill.
-- yfinance notes:
-  - it's an unofficial library
-  - it needs **historical** rates for the transaction dates
-  - it needs a mapping from IBM currency names (incl. Bitcoin) to Yahoo tickers
+- `raw/fx/date=<day>/fx.csv`: one small file per day (`currency,usd_per_unit,source`). The history days are uploaded once; the producer sends each live day's file as that simulated day starts. The Glue job reads only the days it processes, so the rate table it broadcasts holds just those days.
+- FX source notes:
+  - Frankfurter API v2 (free, no key): central-bank and official rates for all 14 currencies; Bitcoin from the Swiss Federal Tax Administration
+  - a day with no published rate (Bitcoin on weekends) reuses the last one before it (`source` = `frankfurter-carried`)
 
 **Glue job (ETL, incremental: new dates only, after a one-off backfill)**
 1. Read the raw accounts + FX, and the new date partitions of `raw/transactions/`.
@@ -459,7 +458,7 @@ EventBridge (daily) → Step Functions:
 | Q2 R6 "linked to last run's High tier" | Self-reinforcing; replaced by R12 (analyst-confirmed EDD) |
 | Clearing a customer permanently | Clearances expire and are overridden by new rules or a score jump |
 | Separate Glue Data Quality step, FX Lambda, extra CloudWatch for Q2 | Validation lives in the Glue job |
-| Live RDS instance for the customer DB in the demo | A Glue job in a VPC loses internet access (yfinance), and a NAT gateway costs ~$1/day |
+| Live RDS instance for the customer DB in the demo | A Glue job in a VPC loses internet access (the FX API), and a NAT gateway costs ~$1/day |
 
 ---
 
@@ -533,7 +532,7 @@ Differences from the text above:
 - **Time in the demo.** `created_at` and `expires_at` on an alert are in event time (the payment's own clock), and the apps and the label export read "now" from the producer's simulated clock (`state/sim_clock.json`). `ttl_at` stays on the real clock. Decision events carry `written_at` (real time) to order events made at the same simulated moment.
 - **`new_pair` and `cyc2_hrs`** look back 30 days, so Flink's state stays bounded. The Glue feature job uses the same 30 days.
 - **All banks are streamed.** The producer sends every bank's payments, and `raw/transactions/` holds them all. Flink, the Q1 historical feature job and the Q2 Glue job each keep the payments that involve our bank (`involves_bank()` in `common/aml_clean.py`). Other banks' payments are filtered out, not sent to `dlq/`. The bank is set once, in `main/common/settings.json`.
-- **FX rates.** A rate applies to its own day. The Q2 Glue job fails if any payment date has no rate; it does not fall back to a nearby date. `producer.py fx` fetches rates from yfinance for the prepared dataset's whole date range.
+- **FX rates.** A rate applies to its own day. The Q2 Glue job fails if any payment date has no rate; it does not fall back to a nearby date. `producer.py fx` fetches rates from the Frankfurter API for the prepared dataset's whole date range.
 - **Code layout.** `main/common/` holds only what both pipelines use: the cleaning rules, the simulated clock, and config. Q1's feature and model code is `main/Q1_files/q1_core.py`.
 - **Q2 validation** fails the run if an account at our bank has no customer. A counterparty at another bank that is not in the customer file is kept, with the id `EXT-<bank>-<account>`.
 - **Q2 customer accounts** shown in the app are the accounts the customer used in the 7-day window.
