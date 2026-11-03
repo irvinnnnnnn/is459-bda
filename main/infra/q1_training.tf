@@ -72,6 +72,17 @@ resource "aws_sagemaker_model_package_group" "q1" {
   model_package_group_description = "Approved Q1 laundering-flagging models: artifact, training data and metrics per version."
 }
 
+# terraform destroy: AWS refuses to delete a group that still has versions, so delete them first.
+resource "terraform_data" "q1_model_versions" {
+  input      = { group = aws_sagemaker_model_package_group.q1.model_package_group_name, region = var.region }
+  depends_on = [aws_sagemaker_model_package_group.q1]
+
+  provisioner "local-exec" {
+    when    = destroy
+    command = "python -c \"import boto3; s = boto3.client('sagemaker', region_name='${self.input.region}'); [s.delete_model_package(ModelPackageName=p['ModelPackageArn']) for page in s.get_paginator('list_model_packages').paginate(ModelPackageGroupName='${self.input.group}') for p in page['ModelPackageSummaryList']]\""
+  }
+}
+
 # ------------------------------------- Step Functions: train and promote (spec 3.2) ----
 resource "aws_sfn_state_machine" "q1_train" {
   name     = "q1-train-and-promote"
