@@ -6,7 +6,7 @@ therefore the backfill) and always redoes --run_date itself.
   dates from --live_start    come from raw/transactions/ (Firehose, as received) and are cleaned here
                              with the same rules as Flink; rejected rows go to dlq/ with the reason
 Then it joins each payment to the customer that owns each account, as of the payment's date, and
-adds the USD amounts. The run fails, and writes nothing, if a check fails:
+adds the USD amounts at that date's rate (raw/fx/date=<day>/, read for this run's days only). The run fails, and writes nothing, if a check fails:
   every account at our bank maps to a customer / every currency has a rate for the payment's own
   date / there are payments.
 
@@ -86,18 +86,20 @@ def main():
                    F.trim("customer_id").alias("customer_id"),
                    F.regexp_replace(F.trim("entity_name"), r"\s*#\d+$", "").alias("entity_type"))
            .dropDuplicates(["snapshot_date", "bank", "account"]))
-    fx = (spark.read.csv(f"{base}/raw/fx/", header=True)
-          .select(F.col("date").alias("fx_date"), F.trim("currency").alias("currency"),
-                  F.col("usd_per_unit").cast("double").alias("rate"))
-          .where(F.col("rate") > 0).dropDuplicates(["fx_date", "currency"]))
     snapshots = [r[0] for r in acc.select("snapshot_date").distinct().collect()]
-    fx_dates = [r[0] for r in fx.select("fx_date").distinct().collect()]
-    if not snapshots or not fx_dates:
-        raise RuntimeError("Validation failed: raw/accounts/ or raw/fx/ is empty")
-    no_rates = sorted(set(days) - set(fx_dates))      # a rate is for its own day: never borrow another day's
+    if not snapshots:
+        raise RuntimeError("Validation failed: raw/accounts/ is empty")
+    # FX arrives as one small file per day (raw/fx/date=<day>/). Only this run's days are read, so the
+    # rate table broadcast below holds just those days.
+    no_rates = sorted(set(days) - set(s3_dates(s3, bucket, "raw/fx/")))   # a rate is for its own day: never borrow
     if no_rates:
         raise RuntimeError(f"Validation failed: raw/fx/ has no rates for {no_rates[0]} to {no_rates[-1]} "
-                           f"({len(no_rates)} days). Fetch them with producer.py fx and upload again.")
+                           f"({len(no_rates)} days). The producer sends each live day's rates as the day starts; "
+                           "history days come from producer.py upload --fx.")
+    fx = (spark.read.option("basePath", f"{base}/raw/fx/").csv([f"{base}/raw/fx/date={d}/" for d in days], header=True)
+          .select(F.col("date").cast("string").alias("fx_date"), F.trim("currency").alias("currency"),
+                  F.col("usd_per_unit").cast("double").alias("rate"))
+          .where(F.col("rate") > 0).dropDuplicates(["fx_date", "currency"]))
     cal = spark.createDataFrame([(d, s, d) for d, s in as_of(days, snapshots)],
                                 "date string, snapshot_date string, fx_date string")
 

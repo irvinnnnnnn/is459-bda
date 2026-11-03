@@ -6,6 +6,7 @@ which is set in common/settings.json.
     python producer.py dates   --csv HI-Small_Trans.csv            what dates the dataset covers; writes nothing
     python producer.py prepare --csv HI-Small_Trans.csv            split into history + live day files
     python producer.py fx                                          fetch FX rates for the dataset's date range
+    python producer.py fx --check                                  check the FX file covers every payment
     python producer.py upload  --accounts HI-Small_accounts.csv --fx fx_rates.csv
     python producer.py replay                                      speed 60: 1 real second = 1 simulated minute
     python producer.py replay  --speed 1440                        1 real minute = 1 simulated day
@@ -25,6 +26,8 @@ live day, 00:00) and saves it to S3 (common/sim_clock.py).
 own timestamp. Both Streamlit apps read the same clock, so "now", "expires in" and "today's queue"
 on screen are the producer's now. Stopping the producer (Ctrl+C) pauses the clock; --resume
 restarts both from the same simulated moment.
+
+As each simulated day starts, the producer sends that day's FX rates to raw/fx/date=<day>/ (from --fx).
 
 At each simulated midnight the producer can start the daily jobs for the day that just ended:
     --labels          start the Q1 label export (Glue)
@@ -85,11 +88,12 @@ def stamp(ts):
 
 # ------------------------------------------------------------------ prepare ----
 SUMMARY = "summary.json"
-# IBM currency names -> Yahoo Finance tickers quoted in USD per unit (spec 4.3, reference data).
-FX_TICKERS = {"Euro": "EURUSD=X", "UK Pound": "GBPUSD=X", "Yen": "JPYUSD=X", "Yuan": "CNYUSD=X",
-              "Rupee": "INRUSD=X", "Ruble": "RUBUSD=X", "Australian Dollar": "AUDUSD=X",
-              "Canadian Dollar": "CADUSD=X", "Mexican Peso": "MXNUSD=X", "Brazil Real": "BRLUSD=X",
-              "Swiss Franc": "CHFUSD=X", "Shekel": "ILSUSD=X", "Saudi Riyal": "SARUSD=X", "Bitcoin": "BTC-USD"}
+# IBM currency names -> ISO codes, as served by the Frankfurter API (spec 4.3, reference data). Its v2
+# rates come from central banks and official sources; Bitcoin from the Swiss tax administration.
+FRANKFURTER = "https://api.frankfurter.dev/v2/rates"
+FX_CODES = {"Euro": "EUR", "UK Pound": "GBP", "Yen": "JPY", "Yuan": "CNY", "Rupee": "INR", "Ruble": "RUB",
+            "Australian Dollar": "AUD", "Canadian Dollar": "CAD", "Mexican Peso": "MXN", "Brazil Real": "BRL",
+            "Swiss Franc": "CHF", "Shekel": "ILS", "Saudi Riyal": "SAR", "Bitcoin": "BTC"}
 
 
 def suggest_live_start(counts):
@@ -212,41 +216,98 @@ def fx_gaps(path, first, last):
 
 
 # ----------------------------------------------------------------------- fx ----
+def fx_missing(fx_path, tx_csv):
+    """Every (date, currency) a payment in the transactions CSV uses, paid or received, that the FX
+    file has no rate for. The Q2 Glue job fails its run on any of these, so they are found here first."""
+    have = defaultdict(set)
+    with open(fx_path, newline="") as fh:
+        for r in csv.DictReader(fh):
+            have[r["date"]].add(r["currency"])
+    need = defaultdict(set)
+    with open(tx_csv, newline="") as fh:
+        reader = csv.reader(fh)
+        next(reader)
+        for row in reader:
+            need[row[0][:10].replace("/", "-")].update((row[6], row[8]))
+    return [(d, c) for d in sorted(need) for c in sorted(need[d]) if c not in have[d]]
+
+
+def check_fx(fx_path, tx_csv):
+    for path, fix in ((fx_path, "python producer.py fx"), (tx_csv, "pass the transactions CSV with --csv")):
+        if not os.path.exists(path):
+            sys.exit(f"No file at {path}. To fix: {fix}")
+    log(f"checking {fx_path} against every payment in {tx_csv}")
+    missing = fx_missing(fx_path, tx_csv)
+    if missing:
+        for d, c in missing[:20]:
+            print(f"  no rate: {d} {c}")
+        sys.exit(f"{len(missing)} date/currency pairs used by payments have no rate"
+                 f"{' (first 20 above)' if len(missing) > 20 else ''}. The Q2 runs for those dates would fail.")
+    log("FX check passed: every payment's date and currencies have a rate")
+
+
 def cmd_fx(a):
-    """Fetch daily FX rates for the prepared dataset's whole date range (needs: pip install yfinance)."""
-    try:
-        import yfinance as yf
-    except ImportError:
-        sys.exit("This command needs yfinance: pip install yfinance")
+    """Daily FX rates for the prepared dataset's whole date range, from the Frankfurter API.
+
+    Afterwards the file is checked against the transactions CSV; --check only does the check.
+    """
+    import urllib.request
     info = data_summary(a.data_dir)
+    tx_csv = a.csv or os.path.join(DATASETS, info["csv"])
+    if a.check:
+        return check_fx(a.out, tx_csv)
     first, last = datetime.fromisoformat(info["first_date"]), datetime.fromisoformat(info["last_date"])
     days = [(first + timedelta(days=k)).strftime("%Y-%m-%d") for k in range((last - first).days + 1)]
-    # a week either side, so weekends and holidays at the edges can take the nearest trading day
-    raw = yf.download(list(FX_TICKERS.values()), start=(first - timedelta(days=7)).strftime("%Y-%m-%d"),
-                      end=(last + timedelta(days=8)).strftime("%Y-%m-%d"), progress=False, auto_adjust=False)["Close"]
-    rows, problems = [(d, "US Dollar", 1.0) for d in days], []
-    for name, ticker in FX_TICKERS.items():
-        quoted = {} if ticker not in raw else {ts.strftime("%Y-%m-%d"): float(v) for ts, v in raw[ticker].dropna().items()}
+    # a week either side, so weekends and holidays at the edges can take the nearest published day
+    url = (f"{FRANKFURTER}?from={first - timedelta(days=7):%Y-%m-%d}&to={last + timedelta(days=7):%Y-%m-%d}"
+           f"&base=USD&quotes={','.join(FX_CODES.values())}")
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            published = json.load(resp)                    # [{date, base, quote, rate: units per USD}]
+    except Exception as exc:
+        sys.exit(f"Frankfurter API failed ({exc}). Try again later; nothing was written.")
+    rows, problems = [(d, "US Dollar", 1.0, "base") for d in days], []
+    for name, code in FX_CODES.items():
+        quoted = {r["date"]: 1 / r["rate"] for r in published if r["quote"] == code and r.get("rate")}
         if not quoted:
             problems.append(name)
             continue
         known = sorted(quoted)
-        for d in days:                                  # no quote that day: the last one before it, else the first after
+        for d in days:                    # not published that day: the last one before it, else the first after
             before = [k for k in known if k <= d]
-            rows.append((d, name, quoted[before[-1] if before else known[0]]))
+            k = before[-1] if before else known[0]
+            rows.append((d, name, quoted[k], "frankfurter" if k == d else "frankfurter-carried"))
     if problems:
-        sys.exit(f"Yahoo Finance returned no rates for {problems}. Try again later; nothing was written.")
+        sys.exit(f"Frankfurter returned no rates for {problems}. Try again later; nothing was written.")
     with open(a.out, "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["date", "currency", "usd_per_unit"])
+        w.writerow(["date", "currency", "usd_per_unit", "source"])
         w.writerows(sorted(rows))
-    log(f"wrote {a.out}: {len(FX_TICKERS) + 1} currencies, {days[0]} to {days[-1]}")
+    log(f"wrote {a.out}: {1 + len(FX_CODES)} currencies, {days[0]} to {days[-1]}")
+    check_fx(a.out, tx_csv)
     print(f"Next: python producer.py upload --accounts <accounts CSV> --fx {a.out}")
+
+
+def fx_by_day(path):
+    """The FX file as {date: CSV text of that day's rates}, the form raw/fx/date=<day>/fx.csv takes."""
+    days = defaultdict(list)
+    with open(path, newline="") as fh:
+        for r in csv.DictReader(fh):
+            days[r["date"]].append(f"{r['currency']},{r['usd_per_unit']},{r.get('source', '')}")
+    return {d: "currency,usd_per_unit,source\n" + "\n".join(rows) + "\n" for d, rows in days.items()}
+
+
+def put_fx_day(s3, bucket, day, text):
+    s3.put_object(Bucket=bucket, Key=f"raw/fx/date={day}/fx.csv", Body=text.encode())
 
 
 # ------------------------------------------------------------------- upload ----
 def cmd_upload(a):
-    """One-off uploads: the labelled history, the customer master export and the FX rates."""
+    """One-off uploads: the labelled history, the customer master export and the history days' FX rates.
+
+    The live days' FX rates are not uploaded here: replay sends each one as its simulated day starts,
+    the way a bank receives the day's rates.
+    """
     import boto3
     cfg = config.load()
     info = data_summary(a.data_dir)
@@ -261,11 +322,15 @@ def cmd_upload(a):
     todo = [(os.path.join(a.data_dir, "historical", "history.csv"), "historical/history.csv")]
     if a.accounts:
         todo.append((a.accounts, f"raw/accounts/snapshot_date={snapshot}/accounts.csv"))
-    if a.fx:
-        todo.append((a.fx, "raw/fx/fx_rates.csv"))
     for path, key in todo:
         s3.upload_file(path, cfg["bucket"], key)
         log(f"uploaded {path} -> s3://{cfg['bucket']}/{key}")
+    if a.fx:
+        hist = {d: text for d, text in fx_by_day(a.fx).items() if d < cfg["live_start"]}
+        for day, text in sorted(hist.items()):
+            put_fx_day(s3, cfg["bucket"], day, text)
+        log(f"uploaded FX rates for the {len(hist)} history days -> s3://{cfg['bucket']}/raw/fx/date=.../fx.csv "
+            "(replay sends each live day's)")
 
 
 # ------------------------------------------------------------------- replay ----
@@ -379,6 +444,11 @@ def cmd_replay(a):
     cfg = config.load(required=("bucket", "stream"))
     clock = SimClock(cfg["bucket"], cfg["region"], cache_seconds=3600)      # we are the only writer
     sender = Sender(boto3.client("kinesis", region_name=cfg["region"]), a.stream or cfg["stream"])
+    s3 = boto3.client("s3", region_name=cfg["region"])
+    fx_path = getattr(a, "fx", None)
+    fx = fx_by_day(fx_path) if fx_path and os.path.exists(fx_path) else {}
+    if not fx:
+        log(f"no FX file at {fx_path}: the live days' rates will not be sent, so the Q2 runs will fail validation")
     saved = clock.state(fresh=True)
     if a.resume and saved:
         start, sent_through = saved["sim_anchor"] if not saved["running"] else clock.now(), saved.get("sent_through", 0)
@@ -403,6 +473,11 @@ def cmd_replay(a):
             midnight = epoch(day) + 86400
             queue = [r for r in (loaded.pop(day, None) or load_day(f, day)) if r[0] > sent_through]
             log(f"{day}: {len(queue)} payments to send")
+            if day in fx:                                # the day's rates arrive as the day starts
+                put_fx_day(s3, cfg["bucket"], day, fx[day])
+                log(f"{day}: sent the day's FX rates to raw/fx/date={day}/")
+            elif fx:
+                log(f"{day}: the FX file has no rates for this day; its Q2 run will fail validation")
             i = 0
             while not stopping["now"]:
                 now = clock.now()
@@ -465,15 +540,17 @@ def main():
     s.add_argument("--csv", required=True)
     s.set_defaults(func=cmd_dates)
 
-    s = sub.add_parser("fx", help="fetch daily FX rates for the prepared dataset's date range (yfinance)")
+    s = sub.add_parser("fx", help="fetch daily FX rates for the prepared dataset's date range (Frankfurter API)")
     s.add_argument("--data-dir", default=DATA)
     s.add_argument("--out", default=os.path.join(DATASETS, "fx_rates.csv"))
+    s.add_argument("--check", action="store_true", help="only check --out against the transactions; fetch nothing")
+    s.add_argument("--csv", help="transactions CSV to check against (default: the one prepare was run on)")
     s.set_defaults(func=cmd_fx)
 
     s = sub.add_parser("upload", help="upload the history, accounts and FX files to S3")
     s.add_argument("--data-dir", default=DATA)
     s.add_argument("--accounts", help="customer master export (HI-Small_accounts.csv)")
-    s.add_argument("--fx", help="FX rates CSV: date,currency,usd_per_unit")
+    s.add_argument("--fx", help="FX rates CSV: date,currency,usd_per_unit,source (only the history days are sent)")
     s.add_argument("--snapshot-date", help="date the accounts export applies from (default: the dataset's first day)")
     s.set_defaults(func=cmd_upload)
 
@@ -486,6 +563,8 @@ def main():
                            help="instead of --speed: how many real minutes one simulated day should take")
     s.add_argument("--start", help="simulated start, YYYY-MM-DD or YYYY-MM-DDTHH:MM (default: first live day)")
     s.add_argument("--end-date", help="last day to send, YYYY-MM-DD")
+    s.add_argument("--fx", default=os.path.join(DATASETS, "fx_rates.csv"),
+                   help="FX rates CSV; each live day's rates are sent to raw/fx/ as the day starts")
     s.add_argument("--resume", action="store_true", help="continue from the saved clock")
     s.add_argument("--stream", help="Kinesis stream (default: from config.json)")
     s.add_argument("--labels", action="store_true", help="start the Q1 label export at each simulated midnight")

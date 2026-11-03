@@ -64,8 +64,11 @@ def main():
         sys.exit("No prepared data. Run: python main/producer/producer.py prepare --csv <transactions CSV>")
     day = os.path.basename(files[0])[5:15]             # the first live day of whatever dataset was prepared
     next_day = (datetime.fromisoformat(day) + timedelta(days=1)).strftime("%Y-%m-%d")
+    fx_file = os.path.join(HERE, ".tmp_fx.csv")
+    with open(fx_file, "w") as fh:
+        fh.write(f"date,currency,usd_per_unit,source\n{day},Euro,1.01,ecb\n{day},US Dollar,1.0,base\n")
     base = dict(data_dir=producer.DATA, start=None, end_date=day, resume=False, stream=None, labels=False,
-                q2="off", flush_wait=0, tick=0.01, dry_run=False)
+                q2="off", flush_wait=0, tick=0.01, dry_run=False, fx=fx_file)
 
     # 1. a whole simulated day (every bank's payments) in about 12 real seconds
     speed = 86400 / 12
@@ -78,6 +81,9 @@ def main():
     print(f"replayed {n} payments of {day} in {took:.1f}s at speed {speed:g}")
     assert n == expected and 11 < took < 16, (n, expected, took)
     assert not clock["running"] and abs(clock["sim_anchor"] - producer.epoch(next_day)) < speed, clock
+    # the day's FX rates went to their own day folder, as the day started
+    fx = s3.objects[f"raw/fx/date={day}/fx.csv"].decode()
+    assert fx == "currency,usd_per_unit,source\nEuro,1.01,ecb\nUS Dollar,1.0,base\n", fx
     # every payment left when the simulated clock reached its own timestamp (never early, at most a tick late)
     start_wall = FakeS3.first_put                      # the moment the producer started the clock
     late = [(w - start_wall) * speed - (producer.epoch(r["txn_ts"]) - producer.epoch(day)) for w, r, _ in kinesis.records]
@@ -102,6 +108,7 @@ def main():
     ids = [r["txn_id"] for _, r, _ in kinesis.records]
     print(f"interrupted after {first} payments at simulated {producer.stamp(paused_at)}, resumed to {len(ids)}")
     assert 0 < first < expected and len(ids) == expected and len(set(ids)) == expected
+    os.remove(fx_file)
 
     # 4. stress: the rate asked for is the rate sent
     kinesis.records.clear()
