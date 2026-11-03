@@ -344,6 +344,8 @@ A demo of the three busy days starts three Q2 runs, about $0.75.
 
 To see what a run actually cost, from what ran on AWS: `python main/scripts/cost.py --since 2026-11-03T09:00 --runs --save run.json` (local time; default the last 24 hours). It prints each billable quantity (KPU-hours, DPU-hours, instance-hours, GB) next to its rate; `--load run.json` prices a saved run again, e.g. after updating the rates at the top of the script.
 
+To project a saved run onto HI-Small, HI-Medium and HI-Large: `python main/scripts/estimate.py --run run.json --mode full|live|month|demo` (full, the default: every busy day of the dataset in real time). Lines billed by the hour are scaled by hours running, lines billed by data by payments, and Glue, EMR and SageMaker by a run time worked out from the data size (Q2's is fitted on the run's own days).
+
 ## Problems
 
 | What you see | What to do |
