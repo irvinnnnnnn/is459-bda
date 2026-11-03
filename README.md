@@ -342,6 +342,8 @@ Rough figures. Three things cost money while idle; the rest only when used.
 
 A demo of the three busy days starts three Q2 runs, about $0.75.
 
+To see what a run actually cost, from what ran on AWS: `python main/scripts/cost.py --since 2026-11-03T09:00 --runs --save run.json` (local time; default the last 24 hours). It prints each billable quantity (KPU-hours, DPU-hours, instance-hours, GB) next to its rate; `--load run.json` prices a saved run again, e.g. after updating the rates at the top of the script.
+
 ## Problems
 
 | What you see | What to do |
