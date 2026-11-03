@@ -318,14 +318,15 @@ class Model:
     def score(self, feats, p, our_bank):
         """Our bank's view of the payment: sender's, receiver's, or both; the score is the higher.
 
-        For a cross-bank payment the other bank's features are blanked. Returns (prob, x, blank).
+        For a cross-bank payment the other bank's features are blanked. A payment inside our bank has
+        nothing blanked, so both views are the same and it is scored once. Returns (prob, x, blank).
         """
         cross = p["from_bank"] != p["to_bank"]
         views = []
         if p["from_bank"] == our_bank:
             views.append(self.r_cols if cross else set())
-        if p["to_bank"] == our_bank:
-            views.append(self.s_cols if cross else set())
+        if p["to_bank"] == our_bank and cross:
+            views.append(self.s_cols)
         best = None
         for blank in views or [set()]:
             x = self.vector(feats, blank)
