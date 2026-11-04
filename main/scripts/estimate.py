@@ -60,6 +60,9 @@ class Base:
         self.history = sum(n for d, n in days.items() if d < start)
         self.live = sum(self.day_payments.values())
         self.hours = (datetime.fromisoformat(run["until"]) - datetime.fromisoformat(run["since"])).total_seconds() / HOUR
+        # Flink starts only after setup and training, so it runs for less than the whole window ("2.17 h running")
+        note = run.get("notes", {}).get("Managed Flink", "")
+        self.flink_hours = float(note.split()[0]) if note.endswith("orchestration") else self.hours
         self.speed = f["replay_speed"]
         self.s3 = f["s3_bytes_by_prefix"]
         self.items = {(i["service"], i["item"]): i for i in run["items"]}
@@ -163,6 +166,7 @@ class Target:
                           for n in ("q2-etl", "q2-emr"))
             other_h = b.hours - b.live_days * 24 / b.speed
             hours = other_h + (setup_s - base_setup) / HOUR + replay_h + (q2_s - base_q2) / HOUR
+            flink_hours = hours - (b.hours - b.flink_hours) - (setup_s - base_setup) / HOUR
             rate_s = self.per_day * self.speed / 86400
             if q2_s > 86400 / self.speed:
                 self.warnings.append(f"a Q2 day takes {q2_s / 60:.0f} min but a replayed day only "
@@ -171,6 +175,7 @@ class Target:
                 self.warnings.append(f"{hours:.1f} h is longer than a 4-hour lab session")
         else:
             hours = MONTH_HOURS if self.mode == "month" else self.q2_days * 24
+            flink_hours = hours                                    # in real time Flink runs the whole period
             rate_s = self.per_day / 86400
         self.hours, self.rate = hours, rate_s
         shards = max(1, math.ceil(rate_s / SHARD_RECORDS_PER_S))
@@ -178,14 +183,14 @@ class Target:
         self.shards, self.kpus = shards, kpus
 
         # time: the measured quantity x (hours now / hours then) x (capacity now / capacity then)
-        r_hours = hours / b.hours
         capacity = {"Managed Flink": (kpus + 1) / 2, "Kinesis Data Streams": shards}
         for (service, item), i in b.items.items():
             if service in ("Managed Flink", "EC2 apps server") or "shard" in item:
                 grow = capacity.get(service, 1.0) if "storage" not in item else kpus
+                h, h_then = (flink_hours, b.flink_hours) if service == "Managed Flink" else (hours, b.hours)
                 detail = {"Managed Flink": f"{kpus} KPU + 1", "Kinesis Data Streams": f"{shards} shard"}.get(service, "")
-                self.add("time", service, item, i["quantity"] * r_hours * grow, i["price"],
-                         f"{hours:,.1f} h" + (f", {detail}" if detail else ""))
+                self.add("time", service, item, i["quantity"] * h / h_then * grow, i["price"],
+                         f"{h:,.1f} h" + (f", {detail}" if detail else ""))
 
         # size: the measured quantity x (payments now / payments then)
         r_live = self.live / b.live
