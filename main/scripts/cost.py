@@ -14,7 +14,7 @@ keeps the quantities; --load prices them again later, e.g. after editing PRICES.
 
 PRICES are us-east-1 on-demand rates: check them on the AWS pricing pages before quoting the result.
 Not counted, because they stay within the free tier or come to cents: Lambda, Step Functions,
-CloudWatch alarms and log storage, S3 requests, EBS volumes on the EMR nodes, data transfer (free inside us-east-1).
+CloudWatch (logs, metrics, alarms), S3 requests, EBS volumes on the EMR nodes, data transfer (free inside us-east-1).
 """
 import argparse
 import json
@@ -45,7 +45,6 @@ PRICES = {
     "dynamodb_read_million": 0.125,
     "athena_tb": 5.0,                     # each query is billed for at least 10 MB
     "s3_gb_month": 0.023,
-    "logs_ingest_gb": 0.50,               # CloudWatch Logs; storing them is $0.03 per GB-month, left out
 }
 # Fixed names from main/infra/*.tf (not in config.json)
 GLUE_JOBS = ["q1-features-historical", "q1-build-training", "q1-label-export", "q2-etl"]
@@ -53,8 +52,6 @@ FIREHOSE = "aml-raw-landing"
 EMR_PREFIX = "q2-score-"
 TRAINING_PREFIX, EVAL_PREFIX = "q1-train", "q1-eval"
 GSI = "status-score-index"
-# log groups the pipeline writes to (the lab account may hold other projects' logs too)
-LOG_PREFIXES = ["/aws/managed-flink/", "/aws-glue/", "/aws/lambda/q2-", "/aws/sagemaker/"]
 GLUE_WORKER_DPU = {"G.025X": 0.25, "G.1X": 1, "G.2X": 2, "G.4X": 4, "G.8X": 8}
 HOUR, MONTH_HOURS, GB = 3600.0, 730.0, 1024 ** 3
 NOT_DEPLOYED = "not deployed (run terraform apply)"
@@ -298,14 +295,19 @@ def s3(s, cfg, w, b):
     b.add("S3 storage", "GB-months", gb * (w.until - w.since).total_seconds() / HOUR / MONTH_HOURS, "s3_gb_month")
 
 
-def logs(s, cfg, w, b):
-    client, cw, groups = s.client("logs"), s.client("cloudwatch"), []
-    for prefix in LOG_PREFIXES:
-        for page in client.get_paginator("describe_log_groups").paginate(logGroupNamePrefix=prefix):
-            groups += [g["logGroupName"] for g in page["logGroups"]]
-    size = sum(sum(metric(cw, w, "AWS/Logs", "IncomingBytes", {"LogGroupName": g}, period=3600)) for g in groups)
-    b.note("CloudWatch Logs", f"{len(groups)} log groups (Flink, Glue, Lambda, SageMaker), {size / 1024 ** 2:,.1f} MB")
-    b.add("CloudWatch Logs", "GB ingested", size / GB, "logs_ingest_gb")
+def q2_queue(s, cfg, w, b):
+    """Customers in the Q2 queue after each nightly run (in_queue in scores/), for estimate.py's reviews."""
+    import io
+    import pyarrow.parquet as pq
+    c, queue = s.client("s3"), {}
+    for page in c.get_paginator("list_objects_v2").paginate(Bucket=cfg["bucket"], Prefix="scores/run_date="):
+        for o in page.get("Contents", []):
+            if o["Key"].endswith(".parquet"):
+                run = o["Key"].split("run_date=", 1)[1].split("/", 1)[0]
+                body = c.get_object(Bucket=cfg["bucket"], Key=o["Key"])["Body"].read()
+                flags = pq.read_table(io.BytesIO(body), columns=["in_queue"]).column("in_queue").to_pylist()
+                queue[run] = queue.get(run, 0) + sum(1 for v in flags if v)
+    b.fact("q2_queue", dict(sorted(queue.items())))
 
 
 def run_facts(s, cfg, w, b):
@@ -332,7 +334,7 @@ def run_facts(s, cfg, w, b):
 COLLECTORS = [("Managed Flink", flink), ("Kinesis Data Streams", kinesis), ("Data Firehose", firehose),
               ("Glue", glue), ("EMR (Q2 scoring clusters)", emr), ("SageMaker (training + evaluation)", sagemaker),
               ("EC2 apps server", ec2_apps), ("DynamoDB alerts table", dynamodb), ("Athena", athena), ("S3 storage", s3),
-              ("CloudWatch Logs", logs), ("Run facts", run_facts)]
+              ("Q2 queue", q2_queue), ("Run facts", run_facts)]
 
 
 def collect(cfg, w):
@@ -411,6 +413,8 @@ def main():
             saved = json.load(fh)
         b = Bill()
         b.items, b.notes, b.runs, b.facts = saved["items"], saved["notes"], saved.get("runs", []), saved.get("facts", {})
+        b.items = [it for it in b.items if not it["service"].startswith("CloudWatch")]   # runs saved before it was dropped
+        b.notes = {k: v for k, v in b.notes.items() if not k.startswith("CloudWatch")}
         since, until = datetime.fromisoformat(saved["since"]), datetime.fromisoformat(saved["until"])
     else:
         cfg = config.load()
@@ -431,7 +435,7 @@ def main():
             json.dump({"since": since.isoformat(), "until": until.isoformat(), "items": b.items, "notes": b.notes,
                        "runs": b.runs, "facts": b.facts, "prices_used": {it["price"]: rate(it["price"]) for it in b.items}}, fh, indent=1)
         print(f"\nSaved the quantities to {a.save}. Price them again later with: python main/scripts/cost.py --load {a.save}")
-    print("\nNot counted (free tier or cents): Lambda, Step Functions, CloudWatch alarms and log storage, S3 requests\n"
+    print("\nNot counted (free tier or cents): Lambda, Step Functions, CloudWatch (logs, metrics, alarms), S3 requests\n"
           "(billed per request, not per GB), EMR node disks, data transfer (free inside us-east-1).")
     print("Rates are PRICES at the top of main/scripts/cost.py: check them against the AWS pricing pages.")
 

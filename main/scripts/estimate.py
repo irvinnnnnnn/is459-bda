@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 """Project a measured run (cost.py --save) onto bigger datasets: HI-Small, HI-Medium, HI-Large.
 
-    python estimate.py --run run1.json                     every busy day of the dataset, in real time
-    python estimate.py --run run1.json --mode live         only the replayed live days (last 30%), in real time
+    python estimate.py --run run1.json                     the live days (last 30% of busy days), in real time
+    python estimate.py --run run1.json --mode full         every busy day streamed, in real time
     python estimate.py --run run1.json --mode month        30 days, running 24/7
     python estimate.py --run run1.json --mode demo --speed 60
 
 Every billed line of the run is scaled by what drives it:
   time      billed by the hour, and the hours do not depend on data (Flink, Kinesis shards, the apps server):
             scaled by how long the pipeline runs
-  size      billed by data (Kinesis PUTs, Firehose GB, DynamoDB writes, logs, S3): scaled by payments
+  size      billed by data (Kinesis PUTs, Firehose GB, DynamoDB writes, S3): scaled by payments
   job       billed by the hour, but a bigger input makes the job run longer (Glue, EMR, SageMaker):
             run time = fixed startup + seconds per payment x payments, then priced like the run was
+  use       Athena queries and DynamoDB reads from people reviewing in the two apps (assumed use, APP_*):
+            an Athena query reads every row of the days it covers (only its columns), and a DynamoDB scan
+            reads the whole alerts table, so both grow with the payments a day
 
 The fixed startup and seconds per payment of Q2 come from the run itself (Q2 days of different sizes).
 Jobs that ran once (training) have one point, so their fixed startup is an assumption, in JOB_FIXED_S.
-Dataset sizes for HI-Small, HI-Medium and HI-Large are the published ones, not measured: replace them in
-DATASETS once the files are downloaded (python main/producer/producer.py dates --csv <file>).
+Dataset sizes in DATASETS were counted from the downloaded files (python main/producer/producer.py dates
+--csv <file>). The history days are trained on in batch; only the live days go through Kinesis and Flink.
 """
 import argparse
 import json
@@ -31,11 +34,13 @@ from cost import HOUR, MONTH_HOURS, GB, rate  # noqa: E402
 
 SUMMARY = os.path.join(HERE, "..", "producer", "data", "summary.json")   # the measured run's dataset (prepare)
 
-# Published sizes (Kaggle "IBM Transactions for Anti Money Laundering"): payments, busy days.
+# Counted from the Kaggle files ("IBM Transactions for Anti Money Laundering"): history payments (before the
+# suggested live_start), live payments (live_start to the last busy day; the thin tail after it is left out),
+# busy days. Busy days are one unbroken block in all three: 09-01..09-10, 09-01..09-16, 08-01..11-05 (2022).
 DATASETS = {
-    "HI-Small": (5_078_345, 10),
-    "HI-Medium": (31_898_238, 16),
-    "HI-Large": (179_702_229, 97),
+    "HI-Small": (3_731_672, 1_345_565, 10),        # live from 2022-09-08, 3 days
+    "HI-Medium": (21_149_143, 10_742_108, 16),     # live from 2022-09-12, 5 days
+    "HI-Large": (127_613_986, 52_047_524, 97),     # live from 2022-10-08, 29 days
 }
 LIVE_SHARE = 0.3                  # the last 30% of busy days are replayed live (producer.suggest_live_start)
 OUR_BANK_SHARE = 0.0526           # payments involving bank 11, measured on the HI-Small sample's live days
@@ -45,8 +50,25 @@ TRAINING_GB_LIMIT = 4.0           # ml.m5.large has 8 GB of memory; above this t
 # Fixed startup seconds of the jobs that ran only once (one point cannot separate fixed from per-payment time)
 JOB_FIXED_S = {"q1-features-historical": 60, "q1-build-training": 30, "q1-train": 60, "q1-eval": 60,
                "q1-label-export": None}          # None: no relation to data size (14-16 s on any day)
+# People reviewing in the apps. Use is assumed (the measured run had no one using the apps); what each
+# action reads and writes comes from the code. The Q1 Metrics page (monitoring) is left out.
+Q1_REVIEWS_PER_DAY = 200          # alerts + audit items reviewed a day, or all of them when fewer are raised
+Q2_REVIEWS_PER_DAY = 15           # customers reviewed a day, or the whole queue when it is shorter
+APP_HOURS_PER_DAY = 8             # one working shift per investigator; Q1 has as many as its reviews need
+MINUTES_PER_LOOKUP = 5            # on the review page; the rest of the shift the Q1 queue page is open
+Q1_SIDES_PER_ALERT = 1.02         # activity queries per alert, one per side at bank 11 (1.6% have both, HI-Small)
+Q1_QUEUE_SCANS_PER_HOUR = 1200    # the Q1 queue re-reads the whole alerts table every 3 s (REFRESH_SECONDS)
+Q1_SCANS_PER_LOOKUP = 10          # 5 reruns (open, claim, decision, reason, comment) x 2 table scans each
+Q1_WRITES_PER_LOOKUP = 2          # claim + decision, each an update of the whole item
+Q2_DECISION_READS_PER_LOOKUP = 3  # the decisions log is re-read before the claim and the decision, plus a reload
+REVIEW_DAYS = 7                   # an alert stays in the table until the label export after its review window
+ATHENA_MIN_BYTES = 10 * 1024 ** 2
+DDB_READ_BYTES = 4096             # a scan costs 0.5 read units per 4 KB read (eventually consistent)
+# (days the query covers, share of the table's bytes in the columns it reads). Shares were measured on Parquet
+# files with the real schemas and real HI-Small rows: the scored rows are mostly feature columns, never read.
+APP_QUERIES = {"q1-account": (30, 0.08), "q2-customer": (7, 0.60)}
 GROUPS = {"time": "Billed by time (hours running)", "size": "Billed by size (payments, GB)",
-          "job": "Billed by time, run time grows with data"}
+          "job": "Billed by time, run time grows with data", "use": "From people using the apps"}
 
 
 # ------------------------------------------------------------------ the measured run ----
@@ -60,9 +82,12 @@ class Base:
         self.history = sum(n for d, n in days.items() if d < start)
         self.live = sum(self.day_payments.values())
         self.hours = (datetime.fromisoformat(run["until"]) - datetime.fromisoformat(run["since"])).total_seconds() / HOUR
-        # Flink starts only after setup and training, so it runs for less than the whole window ("2.17 h running")
+        # Flink starts only after setup and training, so it runs for less than the whole window:
+        # its hours are the KPU-hours over the KPUs billed ("1 KPU + 1 for orchestration")
         note = run.get("notes", {}).get("Managed Flink", "")
-        self.flink_hours = float(note.split()[0]) if note.endswith("orchestration") else self.hours
+        kpu_hours = next((i["quantity"] for i in run["items"] if (i["service"], i["item"]) == ("Managed Flink", "KPU-hours")), None)
+        self.flink_hours = (kpu_hours / (int(note.split(", ")[1].split()[0]) + 1)
+                            if kpu_hours and note.endswith("orchestration") else self.hours)
         self.speed = f["replay_speed"]
         self.s3 = f["s3_bytes_by_prefix"]
         self.items = {(i["service"], i["item"]): i for i in run["items"]}
@@ -103,6 +128,11 @@ class Base:
         return jobs
 
 
+def filled_days(window, days):
+    """Days of data a window holds on average over `days` days, when the data starts empty and fills it."""
+    return sum(min(d, window) for d in range(1, days + 1)) / days
+
+
 def glue_dpu(r):
     return float(r["usage"].split(" x ")[1].split()[0])
 
@@ -120,12 +150,13 @@ def fit(pts):
 
 # ------------------------------------------------------------------ one target ----
 class Target:
-    def __init__(self, name, payments, busy_days, base, mode, speed):
+    def __init__(self, name, history, live, busy_days, base, mode, speed):
         self.name, self.base, self.mode, self.speed = name, base, mode, speed
         live_days = max(1, round(busy_days * LIVE_SHARE))
-        self.per_day = payments / busy_days
-        self.history = self.per_day * (busy_days - live_days)
+        self.history = history
         self.q2_days = {"month": 30, "full": busy_days}.get(mode, live_days)
+        # live and demo stream the live days as they are; full and month spread every busy day evenly
+        self.per_day = live / live_days if mode in ("live", "demo") else (history + live) / busy_days
         self.live = self.per_day * self.q2_days
         self.lines, self.durations, self.warnings = [], {}, []
         self.build()
@@ -197,16 +228,66 @@ class Target:
         for (service, item), i in b.items.items():
             if service in ("Kinesis Data Streams", "Data Firehose") and "shard" not in item:
                 self.add("size", service, item, i["quantity"] * r_live, i["price"])
-            elif service == "DynamoDB alerts table":
-                grow = r_live if "write" in item else 1.0        # writes are alerts; reads are people using the app
-                self.add("size", service, item, i["quantity"] * grow, i["price"])
-            elif service == "CloudWatch Logs":
-                self.add("size", service, item, i["quantity"] * r_live, i["price"])
+            elif (service, item) == ("DynamoDB alerts table", "million write request units"):
+                self.add("size", service, "million write request units (alerts)", i["quantity"] * r_live, i["price"])
+        # the alerts table: each alert is written once, read by every scan of the table, and deleted by the daily
+        # label export once its review window has closed. The item size comes from the run's write units per alert.
+        writes = b.items.get(("DynamoDB alerts table", "million write request units"), {}).get("quantity", 0) * 1e6
+        alerts = b.run["facts"].get("alerts_in_table") or 1
+        item_wru = writes / alerts                                # write units per item: about 2, items of 1-2 KB
+        alerts_per_day = alerts / b.live * self.per_day
+        held = filled_days(REVIEW_DAYS, self.q2_days)            # days of alerts in the table, on average
+        scan_ru = max(0.5, alerts_per_day * held * item_wru * 1024 / DDB_READ_BYTES * 0.5)
+        deleted = alerts_per_day * max(0, self.q2_days - REVIEW_DAYS)
+        self.add("size", "DynamoDB alerts table", "million read request units (label export)",
+                 self.q2_days * scan_ru / 1e6, "dynamodb_read_million", f"{self.q2_days} daily scans")
+        self.add("size", "DynamoDB alerts table", "million write request units (label export)",
+                 deleted * item_wru / 1e6, "dynamodb_write_million", f"{deleted:,.0f} alerts deleted")
         fixed = b.s3.get("code", 0)
         data_gb = (sum(b.s3.values()) - fixed) / GB * (self.history + self.live) / (b.history + b.live) + fixed / GB
         self.stored_gb = data_gb
         self.add("size", "S3 storage", "GB-months", data_gb * hours / MONTH_HOURS, "s3_gb_month",
                  f"{data_gb:,.1f} GB for {hours:,.0f} h")
+
+        # use: people reviewing in the apps, each day the smaller of the daily cap and what was flagged that day.
+        # Q2's queue comes from the run's scores (in_queue), grown with the payments a day.
+        q1_day = min(Q1_REVIEWS_PER_DAY, alerts_per_day)
+        queue = b.run["facts"].get("q2_queue")
+        if queue:
+            q2_day = min(Q2_REVIEWS_PER_DAY, sum(queue.values()) / len(queue) * self.per_day / (b.live / b.live_days))
+        else:
+            q2_day = Q2_REVIEWS_PER_DAY
+            self.warnings.append("the run has no Q2 queue size (save it again with the current cost.py): "
+                                 f"assumed at least {Q2_REVIEWS_PER_DAY} customers a day")
+        q1_lookups, q2_lookups = q1_day * self.q2_days, q2_day * self.q2_days
+        people = max(1, math.ceil(q1_day * MINUTES_PER_LOOKUP / 60 / APP_HOURS_PER_DAY))
+        app_h = min(hours, self.q2_days * APP_HOURS_PER_DAY) * people
+        queue_h = max(0.0, app_h - q1_lookups * MINUTES_PER_LOOKUP / 60)
+        # curated/live holds the streamed days only, so a Q1 look-up's 30 days fill up as the period goes on.
+        # The first Q2 run backfills history into customer_txns, so its 7 days are full from the first day.
+        per_payment = {"q1": b.s3.get("curated/live", 0) / b.live,
+                       "q2": b.s3.get("curated/customer_txns", 0) / (b.history + b.live)}
+        days_read = {"q1": filled_days(APP_QUERIES["q1-account"][0], self.q2_days), "q2": APP_QUERIES["q2-customer"][0]}
+
+        def scan(query):
+            share = APP_QUERIES[query][1]
+            return max(self.per_day * days_read[query[:2]] * per_payment[query[:2]] * share, ATHENA_MIN_BYTES)
+
+        # Q1: the account's activity, per side at bank 11. Q2: the customer's payments, the decisions log
+        # (small, so billed at the minimum), and each night's scores (SELECT *) once a day.
+        q1 = q1_lookups * Q1_SIDES_PER_ALERT * scan("q1-account")
+        scores = max(self.per_day * b.s3.get("scores", 0) / b.live, ATHENA_MIN_BYTES)
+        q2 = (q2_lookups * (scan("q2-customer") + Q2_DECISION_READS_PER_LOOKUP * ATHENA_MIN_BYTES)
+              + self.q2_days * scores)
+        self.add("use", "Athena: Q1 investigator app", "TB scanned", q1 / GB / 1024, "athena_tb",
+                 f"{q1_lookups:,.0f} alerts reviewed")
+        self.add("use", "Athena: Q2 KYC app", "TB scanned", q2 / GB / 1024, "athena_tb",
+                 f"{q2_lookups:,.0f} customers reviewed")
+        scans = queue_h * Q1_QUEUE_SCANS_PER_HOUR + q1_lookups * Q1_SCANS_PER_LOOKUP
+        self.add("use", "DynamoDB: Q1 investigator app", "million read request units", scans * scan_ru / 1e6,
+                 "dynamodb_read_million", f"{people} people, {scans:,.0f} table scans")
+        self.add("use", "DynamoDB: Q1 investigator app", "million write request units",
+                 q1_lookups * Q1_WRITES_PER_LOOKUP * item_wru / 1e6, "dynamodb_write_million", "claims + decisions")
 
         train_gb = b.s3.get("training", 0) / GB * self.history / b.history
         if train_gb > TRAINING_GB_LIMIT:
@@ -268,16 +349,18 @@ def report(targets, base, mode, speed):
     for t in targets:
         for msg in t.warnings:
             print(f"! {t.name}: {msg}")
-    print("\nAssumptions: payments spread evenly over the busy days; Q2 time grows in a straight line with the day's"
-          "\npayments; one training run per projection (no retraining); the apps server and Q2 cluster sizes stay"
-          "\nthe same. Dataset sizes are the published ones until replaced in DATASETS.")
+    print("\nAssumptions: payments spread evenly over the days streamed; Q2 time grows in a straight line with the"
+          "\nday's payments; one training run per projection (no retraining); the apps server and Q2 cluster sizes"
+          f"\nstay the same; each day up to {Q1_REVIEWS_PER_DAY} Q1 alerts and {Q2_REVIEWS_PER_DAY} Q2 customers are"
+          f"\nreviewed, {MINUTES_PER_LOOKUP} min each, in {APP_HOURS_PER_DAY} h shifts; Metrics page not opened"
+          "\n(APP_*, Q1_*, Q2_* constants).")
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--run", required=True, help="the file cost.py --save wrote")
     p.add_argument("--summary", default=SUMMARY, help="the measured run's dataset summary (producer prepare)")
-    p.add_argument("--mode", choices=["full", "live", "month", "demo"], default="full")
+    p.add_argument("--mode", choices=["live", "full", "month", "demo"], default="live")
     p.add_argument("--speed", type=float, default=60, help="replay speed for --mode demo")
     a = p.parse_args()
     with open(a.run) as fh:
@@ -290,8 +373,8 @@ def main():
     # the measured dataset itself comes first, so the projection can be checked against the run
     sizes = sorted(summary["days"].values())
     busy = len([n for n in sizes if n >= sizes[len(sizes) // 2] / 10])
-    targets = [Target("measured set", base.history + base.live, busy, base, a.mode, a.speed)]
-    targets += [Target(name, n, days, base, a.mode, a.speed) for name, (n, days) in DATASETS.items()]
+    targets = [Target("measured set", base.history, base.live, busy, base, a.mode, a.speed)]
+    targets += [Target(name, h, n, days, base, a.mode, a.speed) for name, (h, n, days) in DATASETS.items()]
     report(targets, base, a.mode, a.speed)
 
 
