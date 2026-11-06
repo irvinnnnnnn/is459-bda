@@ -35,8 +35,9 @@ resource "aws_iam_role_policy" "pipeline" {
         Effect = "Allow"
         Action = [
           # DeleteObject: Spark's overwrite writes and its _temporary/ cleanup delete files
-          "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:GetBucketLocation",
-          "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"
+          # GetObjectVersion: Managed Flink reads its code zip by version
+          "s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket",
+          "s3:GetBucketLocation", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"
         ]
         Resource = ["arn:aws:s3:::${local.bucket}", "arn:aws:s3:::${local.bucket}/*"]
       },
@@ -86,6 +87,13 @@ resource "aws_iam_role_policy" "pipeline" {
           "arn:aws:logs:${var.region}:${local.account}:log-group:/aws/*",
           "arn:aws:logs:${var.region}:${local.account}:log-group:/aws-glue/*"
         ]
+      },
+      {
+        # DescribeLogGroups is checked against log-group:* (all groups), not one group: Managed Flink
+        # calls it to check its log destination before it starts
+        Effect   = "Allow"
+        Action   = "logs:DescribeLogGroups"
+        Resource = "arn:aws:logs:${var.region}:${local.account}:log-group:*"
       },
       {
         Effect   = "Allow"
@@ -217,6 +225,24 @@ resource "aws_iam_role_policy" "emr_ec2" {
           "s3:ListMultipartUploadParts"
         ]
         Resource = "arn:aws:s3:::${local.bucket}/*"
+      },
+      {
+        # Read-only cluster metadata and metrics, as in AWS's standard EMR instance role
+        # (AmazonElasticMapReduceforEC2Role), which the Learner Lab's LabInstanceProfile also covered
+        Effect = "Allow"
+        Action = [
+          "elasticmapreduce:DescribeCluster", "elasticmapreduce:DescribeStep",
+          "elasticmapreduce:ListBootstrapActions", "elasticmapreduce:ListClusters",
+          "elasticmapreduce:ListInstanceGroups", "elasticmapreduce:ListInstances", "elasticmapreduce:ListSteps",
+          "ec2:Describe*", "cloudwatch:PutMetricData"
+        ]
+        Resource = "*"
+      },
+      {
+        # EMR's own regional buckets (<region>.elasticmapreduce): libraries and step tools some nodes fetch
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:ListBucket"]
+        Resource = ["arn:aws:s3:::*.elasticmapreduce", "arn:aws:s3:::*.elasticmapreduce/*"]
       }
     ]
   })
