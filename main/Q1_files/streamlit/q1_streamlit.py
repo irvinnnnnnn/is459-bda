@@ -189,7 +189,8 @@ def _athena(sql):
     rows = []
     for page in ath.get_paginator("get_query_results").paginate(QueryExecutionId=qid):
         rows += [[c.get("VarCharValue") for c in r["Data"]] for r in page["ResultSet"]["Rows"]]
-    return pd.DataFrame(rows[1:], columns=rows[0]) if rows else pd.DataFrame()
+    # dtype=object keeps Athena's empty values as None; pandas 3's string dtype would turn them into NaN, which is truthy
+    return pd.DataFrame(rows[1:], columns=rows[0], dtype=object) if rows else pd.DataFrame()
 
 
 def _plain(v):
