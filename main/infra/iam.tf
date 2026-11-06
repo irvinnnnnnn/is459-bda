@@ -76,21 +76,38 @@ resource "aws_iam_role_policy" "pipeline" {
         Resource = "*"
       },
       {
-        Effect   = "Allow"
-        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:DescribeLogStreams", "logs:PutLogEvents"]
-        Resource = "arn:aws:logs:${var.region}:${local.account}:log-group:/aws/*"
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup", "logs:CreateLogStream", "logs:DescribeLogGroups", "logs:DescribeLogStreams",
+          "logs:PutLogEvents"
+        ]
+        Resource = [
+          "arn:aws:logs:${var.region}:${local.account}:log-group:/aws/*",
+          "arn:aws:logs:${var.region}:${local.account}:log-group:/aws-glue/*"
+        ]
       },
       {
         Effect   = "Allow"
-        Action   = ["cloudwatch:GetMetricStatistics"]
+        Action   = ["cloudwatch:GetMetricStatistics", "cloudwatch:PutMetricData"]
         Resource = "*"
       },
       {
+        # Pulling the AWS scikit-learn container for SageMaker training and evaluation
+        Effect = "Allow"
+        Action = [
+          "ecr:GetAuthorizationToken", "ecr:BatchCheckLayerAvailability", "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage"
+        ]
+        Resource = "*"
+      },
+      {
+        # Training (createTrainingJob.sync), evaluation (createProcessingJob.sync) and the model registry
         Effect = "Allow"
         Action = [
           "sagemaker:CreateTrainingJob", "sagemaker:DescribeTrainingJob", "sagemaker:StopTrainingJob",
+          "sagemaker:CreateProcessingJob", "sagemaker:DescribeProcessingJob", "sagemaker:StopProcessingJob",
           "sagemaker:CreateModelPackage", "sagemaker:DescribeModelPackage", "sagemaker:ListModelPackages",
-          "sagemaker:AddTags", "sagemaker:CreateModel"
+          "sagemaker:AddTags", "sagemaker:ListTags", "sagemaker:CreateModel"
         ]
         Resource = "*"
       },
@@ -107,9 +124,17 @@ resource "aws_iam_role_policy" "pipeline" {
         Effect = "Allow"
         Action = [
           "elasticmapreduce:RunJobFlow", "elasticmapreduce:DescribeCluster", "elasticmapreduce:AddJobFlowSteps",
-          "elasticmapreduce:DescribeStep", "elasticmapreduce:TerminateJobFlows"
+          "elasticmapreduce:DescribeStep", "elasticmapreduce:CancelSteps", "elasticmapreduce:ListSteps",
+          "elasticmapreduce:TerminateJobFlows", "elasticmapreduce:AddTags"
         ]
         Resource = "*"
+      },
+      {
+        # A new account has no EMR cleanup service-linked role yet; the first cluster launch creates it
+        Effect    = "Allow"
+        Action    = "iam:CreateServiceLinkedRole"
+        Resource  = "arn:aws:iam::${local.account}:role/aws-service-role/*"
+        Condition = { StringLike = { "iam:AWSServiceName" = ["elasticmapreduce.amazonaws.com", "spot.amazonaws.com"] } }
       },
       {
         Effect = "Allow"
