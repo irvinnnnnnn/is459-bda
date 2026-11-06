@@ -34,7 +34,8 @@ resource "aws_iam_role_policy" "pipeline" {
       {
         Effect = "Allow"
         Action = [
-          "s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:GetBucketLocation",
+          # DeleteObject: Spark's overwrite writes and its _temporary/ cleanup delete files
+          "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:GetBucketLocation",
           "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"
         ]
         Resource = ["arn:aws:s3:::${local.bucket}", "arn:aws:s3:::${local.bucket}/*"]
@@ -212,7 +213,8 @@ resource "aws_iam_role_policy" "emr_ec2" {
       {
         Effect = "Allow"
         Action = [
-          "s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"
+          "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload",
+          "s3:ListMultipartUploadParts"
         ]
         Resource = "arn:aws:s3:::${local.bucket}/*"
       }
