@@ -16,7 +16,7 @@ import os
 import time
 from datetime import datetime, timezone
 
-from pyflink.common import Duration, Types, WatermarkStrategy
+from pyflink.common import Configuration, Duration, Types, WatermarkStrategy
 from pyflink.common.watermark_strategy import TimestampAssigner
 from pyflink.datastream import KeyedProcessFunction, ProcessFunction, StreamExecutionEnvironment
 from pyflink.datastream.state import ListStateDescriptor, ValueStateDescriptor
@@ -190,6 +190,9 @@ class S3Batch(KeyedProcessFunction):
 def main():
     props = load_props()
     env = StreamExecutionEnvironment.get_execution_environment()
+    configuration = Configuration()
+    configuration.set_integer("python.fn-execution.bundle.time", int(props.get("python.bundle.time.ms", "100")))
+    env.configure(configuration)
     t_env = StreamTableEnvironment.create(env)
     t_env.get_config().set("table.local-time-zone", "UTC")
     for f in ("aml_clean.py", "q1_core.py", "q1_scoring.py"):

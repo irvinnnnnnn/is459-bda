@@ -35,6 +35,17 @@ variable "flink_parallelism" {
   default     = 1
 }
 
+variable "flink_bundle_time_ms" {
+  description = "Python bundle timeout in milliseconds. Lower values reduce buffering latency with more execution overhead."
+  type        = number
+  default     = 100
+
+  validation {
+    condition     = var.flink_bundle_time_ms >= 1 && floor(var.flink_bundle_time_ms) == var.flink_bundle_time_ms
+    error_message = "Bundle timeout must be a positive integer."
+  }
+}
+
 variable "flink_runtime" {
   type    = string
   default = "FLINK-1_19"

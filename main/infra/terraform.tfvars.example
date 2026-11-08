@@ -13,7 +13,8 @@
 
 # Stress testing: more shards take more payments a second; more parallelism scores them faster.
 # kinesis_shards    = 1
-# flink_parallelism = 1
+# flink_parallelism = 4
+# flink_bundle_time_ms = 100
 
 # Outside the Learner Lab you can use spot core nodes, as the spec describes.
 # emr_use_spot      = false

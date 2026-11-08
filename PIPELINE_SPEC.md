@@ -539,3 +539,12 @@ Differences from the text above:
 - **IAM.** Every service runs as `LabRole`, because the Learner Lab cannot create roles.
 
 Not yet run on AWS: see `README.md` for the tests that run on a laptop, and what they cover.
+
+## Q1 Python execution tuning
+
+The Flink application explicitly sets `python.fn-execution.bundle.time` from the
+Terraform `flink_bundle_time_ms` setting (default 100 ms) before constructing the
+stream graph. This reduces Python bundle buffering; scoring logic, event-time
+features and the S3 flush interval are unchanged. Use `flink_parallelism = 4` in
+local `terraform.tfvars` for the four-subtask deployment. The reusable parallelism
+default remains 1. Rebuild the application package before applying code changes.

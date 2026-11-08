@@ -172,17 +172,18 @@ resource "aws_kinesisanalyticsv2_application" "q1" {
       property_group {
         property_group_id = "app"
         property_map = {
-          "bucket"        = local.bucket
-          "stream.name"   = local.stream_name
-          "aws.region"    = var.region
-          "our.bank"      = local.our_bank
-          "alerts.table"  = aws_dynamodb_table.alerts.name
-          "audit.rate"    = tostring(var.audit_rate)
-          "init.position" = "LATEST"
-          "seed.path"     = var.flink_seed ? "${local.s3}/state/flink_seed/" : ""
-          "flush.seconds" = "30"
-          "flush.rows"    = "5000"
-          "sink.buckets"  = tostring(max(1, var.flink_parallelism))
+          "bucket"                = local.bucket
+          "stream.name"           = local.stream_name
+          "aws.region"            = var.region
+          "our.bank"              = local.our_bank
+          "alerts.table"          = aws_dynamodb_table.alerts.name
+          "audit.rate"            = tostring(var.audit_rate)
+          "init.position"         = "LATEST"
+          "seed.path"             = var.flink_seed ? "${local.s3}/state/flink_seed/" : ""
+          "flush.seconds"         = "30"
+          "flush.rows"            = "5000"
+          "sink.buckets"          = tostring(max(1, var.flink_parallelism))
+          "python.bundle.time.ms" = tostring(var.flink_bundle_time_ms)
         }
       }
     }
