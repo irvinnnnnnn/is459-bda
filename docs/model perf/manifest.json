@@ -1,0 +1,15 @@
+{
+  "version": "2026-11-06-7da78a53",
+  "artifact": "models/artifacts/run=2026-11-06-7da78a53/",
+  "threshold": 0.036033772154929186,
+  "training_data": "training/run=2026-11-06-7da78a53/",
+  "metrics": {
+    "version": "2026-11-06-7da78a53",
+    "alerts": 290,
+    "caught": 60,
+    "recall_at_budget": 0.6122448979591837,
+    "precision_at_budget": 0.20689655172413793,
+    "pr_auc": 0.3826089225457544
+  },
+  "approved_at": "2026-11-06T07:48:53+00:00"
+}

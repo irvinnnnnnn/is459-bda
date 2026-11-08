@@ -1,0 +1,355 @@
+{
+ "since": "2026-11-06T06:08:00+00:00",
+ "until": "2026-11-06T20:21:37.022000+00:00",
+ "items": [
+  {
+   "service": "Managed Flink",
+   "item": "KPU-hours",
+   "quantity": 24.987234444444443,
+   "price": "flink_kpu_hour"
+  },
+  {
+   "service": "Managed Flink",
+   "item": "running storage GB-months",
+   "quantity": 0.855727207001522,
+   "price": "flink_storage_gb_month"
+  },
+  {
+   "service": "Kinesis Data Streams",
+   "item": "shard-hours",
+   "quantity": 13.754172777777777,
+   "price": "kinesis_shard_hour"
+  },
+  {
+   "service": "Kinesis Data Streams",
+   "item": "million PUT payload units",
+   "quantity": 10.742108,
+   "price": "kinesis_put_million"
+  },
+  {
+   "service": "Data Firehose",
+   "item": "GB ingested (5 KB per record)",
+   "quantity": 51.22236251831055,
+   "price": "firehose_ingest_gb"
+  },
+  {
+   "service": "Data Firehose",
+   "item": "GB converted to Parquet",
+   "quantity": 51.22236251831055,
+   "price": "firehose_conversion_gb"
+  },
+  {
+   "service": "Data Firehose",
+   "item": "GB dynamically partitioned",
+   "quantity": 3.7265718020498753,
+   "price": "firehose_partitioning_gb"
+  },
+  {
+   "service": "Glue q1-features-historical",
+   "item": "DPU-hours (1-minute minimum per run)",
+   "quantity": 0.6294444444444445,
+   "price": "glue_dpu_hour"
+  },
+  {
+   "service": "Glue q1-build-training",
+   "item": "DPU-hours (1-minute minimum per run)",
+   "quantity": 0.03611111111111111,
+   "price": "glue_dpu_hour"
+  },
+  {
+   "service": "Glue q1-label-export",
+   "item": "DPU-hours (1-minute minimum per run)",
+   "quantity": 0.005208333333333333,
+   "price": "glue_dpu_hour"
+  },
+  {
+   "service": "Glue q2-etl",
+   "item": "DPU-hours (1-minute minimum per run)",
+   "quantity": 0.45944444444444443,
+   "price": "glue_dpu_hour"
+  },
+  {
+   "service": "EMR (Q2 scoring clusters)",
+   "item": "m5.xlarge instance-hours: EC2",
+   "quantity": 2.0021483333333334,
+   "price": "ec2_hour:m5.xlarge"
+  },
+  {
+   "service": "EMR (Q2 scoring clusters)",
+   "item": "m5.xlarge instance-hours: EMR fee",
+   "quantity": 2.0021483333333334,
+   "price": "emr_hour:m5.xlarge"
+  },
+  {
+   "service": "SageMaker (training + evaluation)",
+   "item": "ml.m5.large instance-hours",
+   "quantity": 0.0708836111111111,
+   "price": "sagemaker_hour:ml.m5.large"
+  },
+  {
+   "service": "EC2 apps server",
+   "item": "t3.small instance-hours",
+   "quantity": 13.823738250555555,
+   "price": "ec2_hour:t3.small"
+  },
+  {
+   "service": "EC2 apps server",
+   "item": "public IPv4 address-hours",
+   "quantity": 13.823738250555555,
+   "price": "public_ipv4_hour"
+  },
+  {
+   "service": "EC2 apps server",
+   "item": "EBS GB-months",
+   "quantity": 0.15065151293759513,
+   "price": "ebs_gb_month"
+  },
+  {
+   "service": "DynamoDB alerts table",
+   "item": "million write request units",
+   "quantity": 0.003616,
+   "price": "dynamodb_write_million"
+  },
+  {
+   "service": "DynamoDB alerts table",
+   "item": "million read request units",
+   "quantity": 0.0149075,
+   "price": "dynamodb_read_million"
+  },
+  {
+   "service": "Athena",
+   "item": "TB scanned (10 MB minimum per query)",
+   "quantity": 0.0009059906005859375,
+   "price": "athena_tb"
+  },
+  {
+   "service": "S3 storage",
+   "item": "GB-months",
+   "quantity": 0.058703439002152344,
+   "price": "s3_gb_month"
+  }
+ ],
+ "notes": {
+  "Managed Flink": "12.49 h running, 1 KPU + 1 for orchestration",
+  "Kinesis Data Streams": "1 shard for 13.8 h, 10,742,108 payments, 381 B each",
+  "Data Firehose": "10,742,108 records, 3.727 GB actual",
+  "Glue q1-features-historical": "1 run, 1,133 s in all",
+  "Glue q1-build-training": "1 run, 65 s in all",
+  "Glue q1-label-export": "5 runs, 70 s in all",
+  "Glue q2-etl": "5 runs, 827 s in all",
+  "EMR (Q2 scoring clusters)": "5 clusters, 2,403 s in all",
+  "SageMaker (training + evaluation)": "2 jobs",
+  "EC2 apps server": "t3.small running 13.8 h, 8 GB disk",
+  "DynamoDB alerts table": "3,616 write units, 14,908 read units",
+  "Athena": "95 queries",
+  "S3 storage": "3.01 GB stored"
+ },
+ "runs": [
+  {
+   "name": "Glue q1-features-historical",
+   "at": "2026-11-06T07:22:20.961000+00:00",
+   "usage": "1133 s x 2 DPU, SUCCEEDED",
+   "quantity": 0.6294444444444445,
+   "price": "glue_dpu_hour"
+  },
+  {
+   "name": "Glue q1-build-training",
+   "at": "2026-11-06T07:41:26.597000+00:00",
+   "usage": "65 s x 2 DPU, SUCCEEDED",
+   "quantity": 0.03611111111111111,
+   "price": "glue_dpu_hour"
+  },
+  {
+   "name": "Glue q1-label-export",
+   "at": "2026-11-06T20:08:21.996000+00:00",
+   "usage": "12 s x 0.0625 DPU, SUCCEEDED",
+   "quantity": 0.0010416666666666667,
+   "price": "glue_dpu_hour"
+  },
+  {
+   "name": "Glue q1-label-export",
+   "at": "2026-11-06T17:44:22.095000+00:00",
+   "usage": "18 s x 0.0625 DPU, SUCCEEDED",
+   "quantity": 0.0010416666666666667,
+   "price": "glue_dpu_hour"
+  },
+  {
+   "name": "Glue q1-label-export",
+   "at": "2026-11-06T15:20:21.947000+00:00",
+   "usage": "13 s x 0.0625 DPU, SUCCEEDED",
+   "quantity": 0.0010416666666666667,
+   "price": "glue_dpu_hour"
+  },
+  {
+   "name": "Glue q1-label-export",
+   "at": "2026-11-06T12:56:21.923000+00:00",
+   "usage": "14 s x 0.0625 DPU, SUCCEEDED",
+   "quantity": 0.0010416666666666667,
+   "price": "glue_dpu_hour"
+  },
+  {
+   "name": "Glue q1-label-export",
+   "at": "2026-11-06T10:32:21.955000+00:00",
+   "usage": "13 s x 0.0625 DPU, SUCCEEDED",
+   "quantity": 0.0010416666666666667,
+   "price": "glue_dpu_hour"
+  },
+  {
+   "name": "Glue q2-etl",
+   "at": "2026-11-06T20:09:53.322000+00:00",
+   "usage": "176 s x 2 DPU, SUCCEEDED",
+   "quantity": 0.09777777777777778,
+   "price": "glue_dpu_hour"
+  },
+  {
+   "name": "Glue q2-etl",
+   "at": "2026-11-06T17:45:53.291000+00:00",
+   "usage": "171 s x 2 DPU, SUCCEEDED",
+   "quantity": 0.095,
+   "price": "glue_dpu_hour"
+  },
+  {
+   "name": "Glue q2-etl",
+   "at": "2026-11-06T15:21:53.144000+00:00",
+   "usage": "161 s x 2 DPU, SUCCEEDED",
+   "quantity": 0.08944444444444444,
+   "price": "glue_dpu_hour"
+  },
+  {
+   "name": "Glue q2-etl",
+   "at": "2026-11-06T12:57:53.134000+00:00",
+   "usage": "150 s x 2 DPU, SUCCEEDED",
+   "quantity": 0.08333333333333333,
+   "price": "glue_dpu_hour"
+  },
+  {
+   "name": "Glue q2-etl",
+   "at": "2026-11-06T10:33:53.130000+00:00",
+   "usage": "169 s x 2 DPU, SUCCEEDED",
+   "quantity": 0.09388888888888888,
+   "price": "glue_dpu_hour"
+  },
+  {
+   "name": "EMR q2-score-2022-09-16",
+   "at": "2026-11-06T20:13:45.022000+00:00",
+   "usage": "472 s up, 0.393 m5.xlarge instance-hours, TERMINATED",
+   "quantity": 0.3929227777777778,
+   "price": "ec2_hour:m5.xlarge"
+  },
+  {
+   "name": "EMR q2-score-2022-09-15",
+   "at": "2026-11-06T17:49:39.047000+00:00",
+   "usage": "451 s up, 0.375 m5.xlarge instance-hours, TERMINATED",
+   "quantity": 0.3753505555555555,
+   "price": "ec2_hour:m5.xlarge"
+  },
+  {
+   "name": "EMR q2-score-2022-09-14",
+   "at": "2026-11-06T15:25:01.745000+00:00",
+   "usage": "459 s up, 0.382 m5.xlarge instance-hours, TERMINATED",
+   "quantity": 0.38228166666666663,
+   "price": "ec2_hour:m5.xlarge"
+  },
+  {
+   "name": "EMR q2-score-2022-09-13",
+   "at": "2026-11-06T13:00:51.664000+00:00",
+   "usage": "558 s up, 0.465 m5.xlarge instance-hours, TERMINATED",
+   "quantity": 0.46536833333333333,
+   "price": "ec2_hour:m5.xlarge"
+  },
+  {
+   "name": "EMR q2-score-2022-09-12",
+   "at": "2026-11-06T10:36:57.704000+00:00",
+   "usage": "463 s up, 0.386 m5.xlarge instance-hours, TERMINATED",
+   "quantity": 0.386225,
+   "price": "ec2_hour:m5.xlarge"
+  },
+  {
+   "name": "SageMaker q1-train-2026-11-06-7da78a53",
+   "at": "2026-11-06T07:43:22.180000+00:00",
+   "usage": "128 billable s on ml.m5.large",
+   "quantity": 0.035555555555555556,
+   "price": "sagemaker_hour:ml.m5.large"
+  },
+  {
+   "name": "SageMaker q1-eval-2026-11-06-7da78a53",
+   "at": "2026-11-06T07:46:15.084000+00:00",
+   "usage": "127 s on ml.m5.large",
+   "quantity": 0.03532805555555556,
+   "price": "sagemaker_hour:ml.m5.large"
+  }
+ ],
+ "facts": {
+  "s3_bytes_by_prefix": {
+   "athena-results": 1061988,
+   "code": 61835725,
+   "curated": 0,
+   "curated/customer_txns": 17832530,
+   "curated/historical": 24815726,
+   "curated/live": 55347457,
+   "curated_$folder$": 0,
+   "decisions": 17853,
+   "dlq": 0,
+   "historical": 2035064103,
+   "logs": 3781590,
+   "models": 1876900,
+   "raw/accounts": 145008642,
+   "raw/fx": 9968,
+   "raw/transactions": 820210939,
+   "rule_eval": 9100,
+   "rule_hits": 92515,
+   "scores": 933527,
+   "state": 27643012,
+   "state_$folder$": 0,
+   "training": 38714868
+  },
+  "q2_queue": {
+   "2022-09-12": 258,
+   "2022-09-13": 257,
+   "2022-09-14": 258,
+   "2022-09-15": 257,
+   "2022-09-16": 261
+  },
+  "live_start": "2022-09-12",
+  "replayed_through": "2022-09-16T23:59:59.999999+00:00",
+  "live_days_replayed": 5,
+  "replay_speed": 10.0,
+  "our_bank": "11",
+  "q2_runs": {
+   "run-2022-09-16-1793995792": "SUCCEEDED",
+   "run-2022-09-15-1793987152": "SUCCEEDED",
+   "run-2022-09-14-1793978511": "SUCCEEDED",
+   "run-2022-09-13-1793969871": "SUCCEEDED",
+   "run-2022-09-12-1793961231": "SUCCEEDED"
+  },
+  "alerts_in_table": 1803
+ },
+ "prices_used": {
+  "flink_kpu_hour": 0.11,
+  "flink_storage_gb_month": 0.1,
+  "kinesis_shard_hour": 0.015,
+  "kinesis_put_million": 0.014,
+  "firehose_ingest_gb": 0.029,
+  "firehose_conversion_gb": 0.018,
+  "firehose_partitioning_gb": 0.02,
+  "glue_dpu_hour": 0.44,
+  "ec2_hour:m5.xlarge": 0.192,
+  "emr_hour:m5.xlarge": 0.048,
+  "sagemaker_hour:ml.m5.large": 0.115,
+  "ec2_hour:t3.small": 0.0208,
+  "public_ipv4_hour": 0.005,
+  "ebs_gb_month": 0.08,
+  "dynamodb_write_million": 0.625,
+  "dynamodb_read_million": 0.125,
+  "athena_tb": 5.0,
+  "s3_gb_month": 0.023
+ },
+ "edited": {
+  "from": "backup/run_medium.json (cost.py --save, until 2026-11-07T01:17:11Z)",
+  "until": "trimmed to 2026-11-06T20:21:37.022000+00:00, the end of the last Q2 batch job (EMR q2-score-2022-09-16: start 20:13:45 + 472 s up); 4.926 h of idle time after the demo removed",
+  "time_lines": "Kinesis shard-hours and apps EC2 instance/IPv4 hours minus 4.926 h; EBS by its own hours since launch; S3 storage x 14.227/19.153 h",
+  "flink": "start estimated 07:52 UTC (model evaluation ended 07:48:22, replay started 08:09, 17.33 h uptime ending by 01:17); 12.494 h x 2 KPU. Each 5 min of error = $0.02",
+  "duplicate_setup": "removed the first setup attempt, which never reached evaluation: Glue q1-features-historical at 06:49:59 (1182 s x 2 DPU, SUCCEEDED); Glue q1-build-training at 07:10:04 (63 s x 2 DPU, SUCCEEDED); SageMaker q1-train-2026-11-06-f55cdee3 at 07:12:05 (114 billable s on ml.m5.large)",
+  "unchanged": "usage-billed lines (Kinesis PUTs, Firehose, DynamoDB, Athena, label exports, the 5 Q2 Glue + EMR runs) and facts: all inside the trimmed window"
+ }
+}

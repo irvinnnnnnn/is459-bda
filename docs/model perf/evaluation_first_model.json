@@ -1,0 +1,16 @@
+{
+  "run_id": "2026-11-06-7da78a53",
+  "test_payments": 29009,
+  "test_laundering": 98,
+  "challenger": {
+    "version": "2026-11-06-7da78a53",
+    "alerts": 290,
+    "caught": 60,
+    "recall_at_budget": 0.6122448979591837,
+    "precision_at_budget": 0.20689655172413793,
+    "pr_auc": 0.3826089225457544
+  },
+  "champion": null,
+  "promote": true,
+  "reason": "No approved model yet: the first model is promoted."
+}
