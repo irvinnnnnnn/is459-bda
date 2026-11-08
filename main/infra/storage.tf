@@ -70,7 +70,10 @@ locals {
     ["to_bank", "string"], ["to_account", "string"], ["amount_paid", "double"], ["payment_currency", "string"],
     ["amount_received", "double"], ["receiving_currency", "string"], ["payment_format", "string"],
   ]
-  feature_columns = [for f in local.schema.features : [f, "double"]]
+  # Glue stores column names in lower case (s_out_n_1D -> s_out_n_1d). Sending them lower-cased
+  # already stops every plan from showing these tables as changed. Athena matches names ignoring case.
+  feature_columns = [for f in local.schema.features : [lower(f), "double"]]
+  scored_columns  = [for c in local.schema.scored_columns : [lower(c[0]), c[1]]]
 
   tables = {
     # Firehose converts to Parquet against this table, so it must exist before Firehose starts.
@@ -84,7 +87,7 @@ locals {
     live_scored = {
       location  = "curated/live/scored/"
       partition = "date"
-      columns   = local.schema.scored_columns
+      columns   = local.scored_columns
     }
     live_labels = {
       location  = "curated/live/labels/"

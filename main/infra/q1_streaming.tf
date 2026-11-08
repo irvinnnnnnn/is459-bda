@@ -220,4 +220,10 @@ resource "aws_kinesisanalyticsv2_application" "q1" {
   cloudwatch_logging_options {
     log_stream_arn = aws_cloudwatch_log_stream.flink.arn
   }
+
+  # AWS keeps the run configuration only while the app runs, so a stopped app always differs and
+  # every plan would try to add it again. scripts/pipeline.py passes it at each start instead.
+  lifecycle {
+    ignore_changes = [application_configuration[0].run_configuration]
+  }
 }

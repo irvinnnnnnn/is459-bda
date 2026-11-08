@@ -34,8 +34,10 @@ resource "aws_iam_role_policy" "pipeline" {
       {
         Effect = "Allow"
         Action = [
-          "s3:GetObject", "s3:PutObject", "s3:ListBucket", "s3:GetBucketLocation",
-          "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"
+          # DeleteObject: Spark's overwrite writes and its _temporary/ cleanup delete files
+          # GetObjectVersion: Managed Flink reads its code zip by version
+          "s3:GetObject", "s3:GetObjectVersion", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket",
+          "s3:GetBucketLocation", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"
         ]
         Resource = ["arn:aws:s3:::${local.bucket}", "arn:aws:s3:::${local.bucket}/*"]
       },
@@ -76,21 +78,45 @@ resource "aws_iam_role_policy" "pipeline" {
         Resource = "*"
       },
       {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup", "logs:CreateLogStream", "logs:DescribeLogGroups", "logs:DescribeLogStreams",
+          "logs:PutLogEvents"
+        ]
+        Resource = [
+          "arn:aws:logs:${var.region}:${local.account}:log-group:/aws/*",
+          "arn:aws:logs:${var.region}:${local.account}:log-group:/aws-glue/*"
+        ]
+      },
+      {
+        # DescribeLogGroups is checked against log-group:* (all groups), not one group: Managed Flink
+        # calls it to check its log destination before it starts
         Effect   = "Allow"
-        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:DescribeLogStreams", "logs:PutLogEvents"]
-        Resource = "arn:aws:logs:${var.region}:${local.account}:log-group:/aws/*"
+        Action   = "logs:DescribeLogGroups"
+        Resource = "arn:aws:logs:${var.region}:${local.account}:log-group:*"
       },
       {
         Effect   = "Allow"
-        Action   = ["cloudwatch:GetMetricStatistics"]
+        Action   = ["cloudwatch:GetMetricStatistics", "cloudwatch:PutMetricData"]
         Resource = "*"
       },
       {
+        # Pulling the AWS scikit-learn container for SageMaker training and evaluation
+        Effect = "Allow"
+        Action = [
+          "ecr:GetAuthorizationToken", "ecr:BatchCheckLayerAvailability", "ecr:GetDownloadUrlForLayer",
+          "ecr:BatchGetImage"
+        ]
+        Resource = "*"
+      },
+      {
+        # Training (createTrainingJob.sync), evaluation (createProcessingJob.sync) and the model registry
         Effect = "Allow"
         Action = [
           "sagemaker:CreateTrainingJob", "sagemaker:DescribeTrainingJob", "sagemaker:StopTrainingJob",
+          "sagemaker:CreateProcessingJob", "sagemaker:DescribeProcessingJob", "sagemaker:StopProcessingJob",
           "sagemaker:CreateModelPackage", "sagemaker:DescribeModelPackage", "sagemaker:ListModelPackages",
-          "sagemaker:AddTags", "sagemaker:CreateModel"
+          "sagemaker:AddTags", "sagemaker:ListTags", "sagemaker:CreateModel"
         ]
         Resource = "*"
       },
@@ -107,9 +133,17 @@ resource "aws_iam_role_policy" "pipeline" {
         Effect = "Allow"
         Action = [
           "elasticmapreduce:RunJobFlow", "elasticmapreduce:DescribeCluster", "elasticmapreduce:AddJobFlowSteps",
-          "elasticmapreduce:DescribeStep", "elasticmapreduce:TerminateJobFlows"
+          "elasticmapreduce:DescribeStep", "elasticmapreduce:CancelSteps", "elasticmapreduce:ListSteps",
+          "elasticmapreduce:TerminateJobFlows", "elasticmapreduce:AddTags"
         ]
         Resource = "*"
+      },
+      {
+        # A new account has no EMR cleanup service-linked role yet; the first cluster launch creates it
+        Effect    = "Allow"
+        Action    = "iam:CreateServiceLinkedRole"
+        Resource  = "arn:aws:iam::${local.account}:role/aws-service-role/*"
+        Condition = { StringLike = { "iam:AWSServiceName" = ["elasticmapreduce.amazonaws.com", "spot.amazonaws.com"] } }
       },
       {
         Effect = "Allow"
@@ -187,9 +221,28 @@ resource "aws_iam_role_policy" "emr_ec2" {
       {
         Effect = "Allow"
         Action = [
-          "s3:GetObject", "s3:PutObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"
+          "s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload",
+          "s3:ListMultipartUploadParts"
         ]
         Resource = "arn:aws:s3:::${local.bucket}/*"
+      },
+      {
+        # Read-only cluster metadata and metrics, as in AWS's standard EMR instance role
+        # (AmazonElasticMapReduceforEC2Role), which the Learner Lab's LabInstanceProfile also covered
+        Effect = "Allow"
+        Action = [
+          "elasticmapreduce:DescribeCluster", "elasticmapreduce:DescribeStep",
+          "elasticmapreduce:ListBootstrapActions", "elasticmapreduce:ListClusters",
+          "elasticmapreduce:ListInstanceGroups", "elasticmapreduce:ListInstances", "elasticmapreduce:ListSteps",
+          "ec2:Describe*", "cloudwatch:PutMetricData"
+        ]
+        Resource = "*"
+      },
+      {
+        # EMR's own regional buckets (<region>.elasticmapreduce): libraries and step tools some nodes fetch
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:ListBucket"]
+        Resource = ["arn:aws:s3:::*.elasticmapreduce", "arn:aws:s3:::*.elasticmapreduce/*"]
       }
     ]
   })

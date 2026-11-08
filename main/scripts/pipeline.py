@@ -93,10 +93,17 @@ def cmd_setup(cfg, a):
     print("Next: python pipeline.py start")
 
 
+# A code change that adds or removes a step must not block the restart: state for steps that no
+# longer exist is dropped, the rest is restored. AWS only takes this when the app starts, so it is
+# passed here rather than kept in Terraform (where a stopped app never stores it).
+FLINK_RUN = {"AllowNonRestoredState": True}
+
+
 def cmd_start(cfg, a):
     ka, st = flink_status(cfg)
     if st == "READY":
-        ka.start_application(ApplicationName=cfg["flink_app"])
+        ka.start_application(ApplicationName=cfg["flink_app"],
+                             RunConfiguration={"FlinkRunConfiguration": FLINK_RUN})
         log("starting Flink (about 3 minutes) ...")
     wait_flink(cfg, "RUNNING")
     print("Wait about 3 minutes before starting the producer: Flink is loading the last 7 days of history.")
@@ -178,6 +185,7 @@ def cmd_start_fresh(cfg):
     ka, st = flink_status(cfg)
     if st == "READY":
         ka.start_application(ApplicationName=cfg["flink_app"], RunConfiguration={
+            "FlinkRunConfiguration": FLINK_RUN,
             "ApplicationRestoreConfiguration": {"ApplicationRestoreType": "SKIP_RESTORE_FROM_SNAPSHOT"}})
         log("starting Flink with empty state; it will reload the 7-day seed ...")
     wait_flink(cfg, "RUNNING")
