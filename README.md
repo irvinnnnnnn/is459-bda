@@ -1,420 +1,210 @@
-# is459-bda
+# AML Transaction Monitoring and KYC Prioritisation on AWS
 
-IS459 Big Data Architecture, Group 2. An anti-money-laundering (AML) system on AWS, built on the IBM AML dataset. It answers two questions for one bank:
+An end-to-end anti-money-laundering (AML) system built on AWS for the IS459 Big Data Architecture group project (Group 2, SMU). It uses the synthetic [IBM Transactions for Anti Money Laundering](https://www.kaggle.com/datasets/ealtman2019/ibm-transactions-for-anti-money-laundering-aml) dataset and takes the view of a single bank.
 
-- **Q1: which payments look like laundering, right now?** Each payment is scored within seconds. The riskiest become alerts for investigators.
-- **Q2: which customers should KYC review first?** Every night, each customer's week of activity is checked against 12 rules and ranked.
-
-Each question has a web app where staff see the results and record decisions.
-
-The design is in [PIPELINE_SPEC.md](PIPELINE_SPEC.md). This README is how to build it and run it.
-
-
-## How it fits together
-
-```
-your laptop                          AWS
------------                          ---
-producer.py  -- payments -->  Kinesis --> Flink --> alerts ---------> Q1 app
-(replays the dataset                  \                                (investigators)
- on a fast clock)                      --> S3 --> nightly job ------> Q2 app
-                                                  (rules, ranking)     (KYC analysts)
-```
-
-- **Terraform** creates everything on the AWS side from the files in `main/infra/`. You describe what you want in files and it builds it, so nobody clicks through the console.
-- **The producer** pretends to be the bank's payment feed. It replays the dataset faster than real time, so several days pass in about an hour.
-- **Two helper scripts** run on your laptop: `producer.py` sends payments, `pipeline.py` starts and stops things.
-
-## Set up (once)
-
-Run every command from the repo root.
-
-### 1. Install the tools
-
-| Tool | Install | Check |
+| | Question | Approach |
 |---|---|---|
-| Python 3.11+ | python.org | `python --version` |
-| Terraform | Windows: `winget install Hashicorp.Terraform` · Mac: `brew install terraform` | `terraform version` |
-| AWS CLI | Windows: `winget install Amazon.AWSCLI` · Mac: `brew install awscli` | `aws --version` |
+| **Q1** | Which payments look like laundering, right now? | Streaming: each payment is scored by a LightGBM model within seconds, and high-risk payments become alerts for investigators |
+| **Q2** | Which customers should KYC prioritise for enhanced due diligence? | Daily batch: each customer's weekly activity is evaluated against 12 rules and ranked |
 
-Open a new terminal after installing, then:
+Each question has a Streamlit application for reviewing results and recording decisions. The full design is in [PIPELINE_SPEC.md](PIPELINE_SPEC.md).
+
+## Architecture
 
 ```
+producer.py ──► Kinesis ──► Managed Flink ──► DynamoDB alerts ──► Q1 app (investigators)
+(dataset replay)    │          (features,          │
+                    │           scoring)           └──► S3 curated/live/scored
+                    │
+                    └──► Firehose ──► S3 raw ──► Glue ──► EMR (rules, ranking) ──► Q2 app (KYC analysts)
+```
+
+**Q1, real-time flagging.** Managed Flink computes 53 per-account features over rolling 1, 5 and 7-day windows, scores each payment, and explains each alert with SHAP risk factors. Alerts and a random audit sample go to DynamoDB for review. Investigator decisions are exported daily to S3 and feed retraining.
+
+**Q1, model training.** A Step Functions workflow builds training features with Glue, trains and evaluates a challenger on SageMaker, and promotes it only if it beats the current model. Flink hot-loads the approved model.
+
+**Q2, daily KYC scoring.** Glue cleans the day's transactions and converts them to USD. A transient EMR Spark cluster aggregates each customer's activity, applies the rules and writes scores, tiers and evidence to S3, queried through Athena.
+
+### AWS services
+
+| Layer | Services |
+|---|---|
+| Ingestion | Kinesis Data Streams, Data Firehose |
+| Processing | Managed Service for Apache Flink, Glue, EMR |
+| Machine learning | SageMaker (training, model registry) |
+| Storage and query | S3 (Parquet), Glue Data Catalog, Athena, DynamoDB |
+| Orchestration | Step Functions, EventBridge, Lambda |
+| Applications | Streamlit on EC2 |
+| Infrastructure | Terraform |
+
+## Repository structure
+
+```
+├── PIPELINE_SPEC.md          Design specification
+├── data/                     Dataset files (git-ignored except fx_rates.csv)
+├── docs/                     Architecture diagram, cost estimates, throughput and model results
+└── main/
+    ├── infra/                Terraform root: one file per area, plus Step Functions (sfn/) and Lambda (lambda/)
+    ├── scripts/              build.py, pipeline.py (operations), cost.py, estimate.py
+    ├── producer/             producer.py (dataset replay), stress.py (load testing)
+    ├── common/               Shared by Q1 and Q2: payment cleaning, simulated clock, config, settings.json
+    ├── Q1_files/             q1_core.py (features, scoring), flink/, glue/, sagemaker/, streamlit/
+    ├── Q2_files/             q2_common.py, glue/, emr/, streamlit/
+    └── tests/                Local tests (no AWS required)
+```
+
+## Getting started
+
+### Prerequisites
+
+- Python 3.11+
+- [Terraform](https://developer.hashicorp.com/terraform/install) 1.5+
+- [AWS CLI](https://aws.amazon.com/cli/) v2
+- An AWS account, with an IAM user that has `AdministratorAccess`
+- `HI-Small_Trans.csv` and `HI-Small_accounts.csv` from the Kaggle dataset, placed in `data/`
+
+### Installation
+
+```bash
 python -m venv .venv
-.venv\Scripts\activate                 (Mac/Linux: source .venv/bin/activate)
+source .venv/bin/activate            # Windows: .venv\Scripts\activate
 pip install boto3 pandas streamlit
 ```
 
-### 2. Connect to your AWS lab account
+### AWS credentials
 
-Do this at the start of **every** lab session, because the credentials expire when the session ends.
+1. In the AWS console, create an access key for the IAM user (**IAM → Users → Security credentials → Create access key**).
+2. Run `aws configure` and enter the access key ID, secret access key, region `us-east-1` and output format `json`. This saves the key to `~/.aws/credentials` (Windows: `C:\Users\<you>\.aws\credentials`).
+3. Confirm the account:
 
-1. Start the Learner Lab and wait for the green dot.
-2. Click **AWS Details**, then **Show** next to AWS CLI.
-3. Copy the whole block into `C:\Users\<you>\.aws\credentials` (Mac/Linux: `~/.aws/credentials`), replacing what is there.
-4. Check it worked: `aws sts get-caller-identity` prints your account number.
+   ```bash
+   aws sts get-caller-identity
+   ```
 
-That file is the only thing that decides which AWS account gets used.
+Terraform and the scripts read the key from that file, and the stack deploys to that account. No account ID is hard-coded.
 
-### 3. Build everything on AWS
+### Configuration
 
-The system is set up for bank 11, with 8 Sep 2022 as the first live day. To use a different bank or date, edit [settings.json](#settingsjson-which-bank-and-which-dates) before you build.
-
-```
-python main/scripts/build.py
-cd main/infra
-terraform init
-terraform apply
-cd ../..
+```bash
+cp main/infra/terraform.tfvars.example main/infra/terraform.tfvars
 ```
 
-| Command | What it does | How long |
-|---|---|---|
-| `build.py` | Packages the code so Terraform can upload it | 1 minute the first time |
-| `terraform init` | Downloads Terraform's AWS plugin. Only needed once | 1 minute |
-| `terraform apply` | Shows what it will create, then asks. Type `yes` | 3 minutes |
+The file sets `manage_iam_resources = true`, so Terraform creates the project's IAM roles, and the stream and Flink capacity.
 
-### 4. Load the data and train the first model
+The bank and the live start date are set in [main/common/settings.json](main/common/settings.json) (defaults: bank `11`, `2022-09-08`). See [Configuration reference](#configuration-reference).
 
-The dataset is not in git. Download `HI-Small_Trans.csv` and `HI-Small_accounts.csv` from Kaggle ("IBM Transactions for Anti Money Laundering") and put them in the [data/](data/) folder at the repo root. Put `fx_rates.csv` (exchange rates) there too if a teammate has one; if not, the middle command below makes it.
+### Deployment
 
-```
+```bash
+python main/scripts/build.py                     # package code for Terraform
+cd main/infra && terraform init && terraform apply && cd ../..
+
 python main/producer/producer.py prepare --csv data/HI-Small_Trans.csv
-python main/producer/producer.py fx                    # only if you have no data/fx_rates.csv
 python main/producer/producer.py upload --accounts data/HI-Small_accounts.csv --fx data/fx_rates.csv
-python main/scripts/pipeline.py setup
+python main/scripts/pipeline.py setup            # build features and train the first model (~20 min)
+python main/scripts/pipeline.py status           # expect Flink READY and an approved model
 ```
 
-| Command | What it does | How long |
-|---|---|---|
-| `prepare` | Splits the dataset: days before 8 Sep 2022 are history for training, later days are replayed live | 1 minute |
-| `fx` | Downloads exchange rates for the dataset's dates (Frankfurter API: central-bank rates, Bitcoin from the Swiss tax administration) into `data/fx_rates.csv`. Days with no published rate take the last one before (`source` = `frankfurter-carried`) | 1 minute |
-| `upload` | Sends the history, the customer list and the history days' exchange rates to AWS. Each live day's rates are sent by `replay` as that simulated day starts | 1 minute |
-| `setup` | Trains the first model | 20 minutes |
+`prepare` splits the dataset at `live_start`: earlier days become training history and later days are replayed live.
 
-Setup is done. You only repeat it after a `terraform destroy`.
+## Usage
 
-## Run a demo
+### Running a demo
 
-**1. Start the real-time scoring** (about 3 minutes):
-
-```
-python main/scripts/pipeline.py start
-```
-
-**2. Start sending payments.** Leave this running in its own terminal:
-
-```
+```bash
+python main/scripts/pipeline.py start            # start Flink; allow ~3 min to load recent history
 python main/producer/producer.py replay --labels --q2 async
+python main/scripts/pipeline.py apps             # print the Q1 and Q2 app URLs (http)
+python main/scripts/pipeline.py stop             # stop Flink when finished
 ```
 
-**3. Open the two apps.** This prints their addresses:
+The producer drives a simulated clock that both apps follow. `--labels` and `--q2 async` run the daily label export and Q2 job at each simulated midnight. Press `Ctrl+C` to pause and `replay --resume` to continue.
 
-```
-python main/scripts/pipeline.py apps
-```
+### Replay speed
 
-```
-  Q1 investigators  http://3.90.12.34:8501
-  Q2 KYC analysts   http://3.90.12.34:8502
-```
+`--speed N` runs the clock N times faster than real time (default 60). For HI-Small:
 
-Use `http`, not `https`. Alerts appear in the Q1 app within a minute or two. The Q2 app fills in after the first simulated day ends (about 35 real minutes at the default speed).
+| `--speed` | One simulated day | Three busy days | Payments/second |
+|---|---|---|---|
+| 24 | 1 h | 3 h | 28 |
+| **60** | **24 min** | **72 min** | **71** |
+| 120 | 12 min | 36 min | 142 |
+| 288 | 5 min | 15 min | 341 |
+| 720 | 2 min | 6 min | 853 |
+| 1440 | 1 min | 3 min | 1,705 |
 
-**4. When you finish, stop the scoring.** It is the one thing that costs money for every hour it runs:
+`--day-minutes N` sets the length of a day directly, and `--dry-run` previews the rate without sending. Each Q2 run takes about 12 real minutes at any speed; `--q2 wait` pauses the clock while it runs. Above speed 800, increase `kinesis_shards`.
 
-```
-python main/scripts/pipeline.py stop
-```
+### Load testing
 
-Useful while a demo runs:
-
-| Do this | To |
-|---|---|
-| `Ctrl+C` in the producer terminal | Pause the demo. The clock in both apps pauses too |
-| `producer.py replay --resume --labels --q2 async` | Carry on from where you paused |
-| `pipeline.py status` | Check scoring is running and a model is loaded |
-
-## Starting again
-
-| | **Reset** | **Destroy** |
-|---|---|---|
-| What it does | Clears the demo's results. Keeps AWS, the history and the model | Deletes everything on AWS |
-| Ready again in | 5 minutes | 25 minutes |
-| Costs while you are away | About $0.90 a day | Nothing |
-| Use it | Between demos in one sitting | When you are done for the day |
-
-**Reset:**
-
-```
-python main/scripts/pipeline.py stop
-python main/scripts/pipeline.py reset --yes
-python main/scripts/pipeline.py start --fresh
-```
-
-**Destroy:**
-
-```
-cd main/infra
-terraform destroy
-cd ../..
-```
-
-To come back after a destroy, repeat [step 3](#3-build-everything-on-aws) (skip `terraform init`) and [step 4](#4-load-the-data-and-train-the-first-model) (skip `prepare`), then start a demo.
-
-> **Before destroying,** check that no Q2 nightly run is in progress (Step Functions console, `q2-daily-kyc-scoring`). Destroying mid-run can leave its cluster running and billing. If that happens, terminate the cluster in the EMR console.
-
-## Replay speed
-
-The producer runs a **simulated clock** that is faster than the real one. `--speed N` means N times faster:
-
-- 1 real second = N simulated seconds
-- 1 simulated day takes 1440 ÷ N real minutes
-
-| `--speed` | 1 real minute is | 1 simulated day takes | The 3 busy days take | Payments sent per second |
-|---|---|---|---|---|
-| 24 | 24 minutes | 1 hour | 3 hours | 28 |
-| **60** (default) | **1 hour** | **24 minutes** | **72 minutes** | **71** |
-| 120 | 2 hours | 12 minutes | 36 minutes | 142 |
-| 288 | 4.8 hours | 5 minutes | 15 minutes | 341 |
-| 720 | 12 hours | 2 minutes | 6 minutes | 853 |
-| 1440 | 1 day | 1 minute | 3 minutes | 1,705 |
-
-```
-python main/producer/producer.py replay --speed 120 --labels --q2 async
-python main/producer/producer.py replay --day-minutes 5 --labels --q2 async     # or say how long a day should take
-python main/producer/producer.py replay --dry-run --speed 300                   # preview a speed; sends nothing
-```
-
-Three things to know:
-
-- **Both apps follow the producer's clock.** The producer saves its clock to AWS, and the apps read it. So "expires in 6 days" on an alert counts simulated days.
-- **The Q2 nightly job takes about 12 real minutes**, whatever the speed. At high speeds the Q2 app lags several simulated days behind. Use `--q2 wait` in place of `--q2 async` to pause the clock while the job runs.
-- **Above speed 800 you need more capacity.** Set `kinesis_shards = 2` (see [Settings](#settings)).
-
-The figures are for HI-Small, which has three busy days (8 to 10 Sep) and then almost nothing.
-
-## Stress test
-
-Sends made-up payments at a rate you choose, to see how fast the pipeline can score. Scoring must be running (`pipeline.py start`).
-
-```
-python main/producer/stress.py run --rate 20 --duration 120            # 20 a second for 2 minutes
-python main/producer/stress.py run --stages 20:60,50:60,100:60         # step the rate up, 60 seconds each
-python main/producer/stress.py report --run-id <id>                    # wait a minute after the run
+```bash
+python main/producer/stress.py run --rate 20 --duration 120
+python main/producer/stress.py run --stages 20:60,50:60,100:60
+python main/producer/stress.py report --run-id <id>    # p50/p99 scoring latency per minute
 python main/producer/stress.py cleanup --run-id <id>
 ```
 
-`run` prints the run id. `report` shows, minute by minute, how long payments took to score: the typical time (p50) and the slowest 1% (p99), in milliseconds.
+Stress payments are excluded from both apps. A steadily rising p99 indicates `flink_parallelism` should be increased.
 
-- **p99 stays flat as the rate goes up:** the pipeline has room to spare.
-- **p99 keeps climbing:** it cannot keep up at that rate. Raise `flink_parallelism` (see [Settings](#settings)).
+### Applications
 
-Stress payments never show up in either app.
+Both apps run on one EC2 instance and are open to anyone with the URL. App changes are deployed with `terraform apply`. To run an app locally against AWS:
 
-## Settings
-
-There are two places: `settings.json` for which bank and which dates, and `terraform.tfvars` for the AWS side.
-
-### settings.json: which bank and which dates
-
-Open [main/common/settings.json](main/common/settings.json) in any editor. It has two values you can change:
-
-```json
-{
-  "our_bank": "11",
-  "live_start": "2022-09-08"
-}
-```
-
-| Setting | Meaning | How to write it |
-|---|---|---|
-| `our_bank` | The bank whose view the system takes. The producer sends every bank's payments, and the pipelines keep only this bank's | The bank's ID in quotes, without leading zeros: `"11"`, not `"011"` |
-| `live_start` | The dividing date. Payments before it are history that trains the model. Payments from it onwards are replayed live | A date in quotes, as `"YYYY-MM-DD"` |
-
-Keep the quotes and the comma, and leave the `_about` line alone. Save the file, then run the commands for what you changed.
-
-**If you have not built anything yet,** edit the file before [step 3](#3-build-everything-on-aws) and carry on as normal. Nothing else is needed.
-
-**If the system is already built and you changed `our_bank`:**
-
-```
-cd main/infra
-terraform apply
-cd ../..
-python main/scripts/pipeline.py stop
-python main/scripts/pipeline.py reset --yes
-python main/scripts/pipeline.py setup
-python main/scripts/pipeline.py start --fresh
-```
-
-**If the system is already built and you changed `live_start`,** the dataset has to be split again first, so add `prepare` and `upload`:
-
-```
-python main/producer/producer.py prepare --csv data/HI-Small_Trans.csv
-python main/producer/producer.py upload --accounts data/HI-Small_accounts.csv --fx data/fx_rates.csv
-cd main/infra
-terraform apply
-cd ../..
-python main/scripts/pipeline.py stop
-python main/scripts/pipeline.py reset --yes
-python main/scripts/pipeline.py setup
-python main/scripts/pipeline.py start --fresh
-```
-
-Both take about 25 minutes, because `setup` trains the model again: a model is built for one bank and one stretch of history.
-
-Not sure which date to use? `python main/producer/producer.py dates --csv <file>` shows the dates a dataset covers and suggests a `live_start`. `prepare` refuses a date that leaves no history or nothing to replay.
-
-### terraform.tfvars: sizes and switches
-
-In `main/infra/`, copy `terraform.tfvars.example` to `terraform.tfvars`, edit it, and run `terraform apply`.
-
-| Setting | Meaning | Default |
-|---|---|---|
-| `kinesis_shards` | Capacity of the payment stream: 1,000 payments a second each | 1 |
-| `flink_parallelism` | How many payments can be scored at once. Each step adds about $0.11 an hour | 1 |
-| `apps_on_ec2` | Host the two apps on AWS | true |
-| `apps_allowed_cidr` | Who can open the apps | anyone |
-
-The full list, with explanations, is in `main/infra/variables.tf`.
-
-## The two apps
-
-Terraform puts both apps on one small AWS server, so there is nothing to run on your laptop.
-
-- **Anyone with the address can open them.** They have no login. The data is synthetic, but stop the server when you are not demoing: `pipeline.py apps stop`, and later `pipeline.py apps start`.
-- **The address changes** whenever the server restarts, which happens with each lab session. `pipeline.py apps` prints the current one.
-- **To change an app,** edit its file and run `terraform apply`. The new version is live in about 4 minutes.
-
-To run an app on your laptop instead, which is quicker when you are changing how it looks:
-
-```
+```bash
 cd main/Q1_files/streamlit
-set Q1_MODE=aws                        (Mac/Linux: export Q1_MODE=aws)
-streamlit run q1_streamlit.py
+Q1_MODE=aws streamlit run q1_streamlit.py              # Windows: set Q1_MODE=aws
 ```
 
-For Q2, use `main/Q2_files/streamlit`, `Q2_MODE` and `q2_streamlit.py --server.port 8502`.
+For Q2, use `main/Q2_files/streamlit`, `Q2_MODE` and `--server.port 8502`.
 
-To try an app with no AWS at all, copy `zArchive/Q1_files/v2/demo_snapshot.json` (or `zArchive/Q2_files/v2/streamlit/demo_snapshot.json`) into the app's folder and run it without setting the mode.
+## Configuration reference
 
-## Using a different dataset
+### settings.json
 
-The other IBM datasets cover different dates, so check before you prepare one:
+| Key | Description | Default |
+|---|---|---|
+| `our_bank` | Bank whose view the system takes (ID without leading zeros) | `"11"` |
+| `live_start` | Split date: earlier payments train the model, later ones are replayed | `"2022-09-08"` |
 
-```
-python main/producer/producer.py dates --csv data/HI-Large_Trans.csv
-```
+`producer.py dates --csv <file>` lists a dataset's dates and suggests a `live_start`. Changing either value after deployment requires `terraform apply`, `pipeline.py reset --yes` and `pipeline.py setup`; changing `live_start` also requires re-running `prepare` and `upload`.
 
-It prints the dates covered and suggests a `live_start`. Then:
+### terraform.tfvars
 
-1. Set `live_start` in `settings.json`.
-2. Run `prepare` on the new file.
-3. Fetch exchange rates for the new dates. A rates file made for HI-Small only covers September 2022. This replaces `data/fx_rates.csv`:
-   ```
-   python main/producer/producer.py fx
-   ```
-4. Run `upload` with the new accounts file and `--fx data/fx_rates.csv`, then `terraform apply` and `pipeline.py setup`.
+| Variable | Description | Default |
+|---|---|---|
+| `manage_iam_resources` | Create the project's IAM roles and instance profiles | `true` |
+| `kinesis_shards` | Stream shards, 1,000 records/second each | `1` |
+| `flink_parallelism` | Flink parallelism (KPUs) | `1` |
 
-The larger datasets have far more payments a day. Run `replay --dry-run` to see the rate before choosing a speed.
+All variables are documented in [main/infra/variables.tf](main/infra/variables.tf).
 
-## Switching AWS accounts
+### Other datasets
 
-1. Run `terraform destroy` while still on the old account.
-2. Paste the new account's credentials ([step 2](#2-connect-to-your-aws-lab-account)).
-3. Build again from [step 3](#3-build-everything-on-aws).
+The HI-Medium, HI-Large and LI datasets cover different dates. Set `live_start` from `producer.py dates`, run `prepare`, fetch matching exchange rates from the [Frankfurter API](https://frankfurter.dev) with `producer.py fx` (replaces `data/fx_rates.csv`), then `upload`, `terraform apply` and `pipeline.py setup`.
 
-If you already switched without destroying, `terraform apply` will fail. Delete `main/infra/terraform.tfstate` and `terraform.tfstate.backup`, then apply again. Those files are Terraform's record of what it built, and they still describe the old account.
+## Operations
 
-## What it costs
-
-Rough figures. Three things cost money while idle; the rest only when used.
-
-| What | Cost |
+| Task | Command |
 |---|---|
-| Real-time scoring (Flink), while running | $0.22 an hour. **Stop it after each demo** |
-| The server for the two apps | $0.50 a day |
-| The payment stream (Kinesis) | $0.36 a day |
-| One Q2 nightly run | $0.25 |
-| One model training run | $0.15 |
-| Everything else | cents |
+| Clear demo results, keep the stack and model | `pipeline.py stop`, `pipeline.py reset --yes`, `pipeline.py start --fresh` |
+| Retrain and promote if better | `pipeline.py retrain` |
+| Run Q2 for one day | `pipeline.py q2 --run-date 2022-09-08` |
+| Export investigator labels | `pipeline.py labels` |
+| Control the simulated clock | `producer.py clock show` / `pause` / `resume` |
+| Cost of a past run | `cost.py --since <time> --runs --save run.json` |
+| Project costs to larger datasets | `estimate.py --run run.json --mode live\|full\|month\|demo` |
+| Tear down | `cd main/infra && terraform destroy` |
 
-A demo of the three busy days starts three Q2 runs, about $0.75.
+All scripts accept `--help`. Avoid destroying the stack while a Q2 run is in progress (`q2-daily-kyc-scoring` in Step Functions), as its EMR cluster may be left running.
 
-To see what a run actually cost, from what ran on AWS: `python main/scripts/cost.py --since 2026-11-03T09:00 --runs --save run.json` (local time; default the last 24 hours). It prints each billable quantity (KPU-hours, DPU-hours, instance-hours, GB) next to its rate; `--load run.json` prices a saved run again, e.g. after updating the rates at the top of the script.
+After a teardown, redeploy with `build.py`, `terraform apply`, `upload` and `pipeline.py setup`. When moving to a different AWS account, destroy the stack first; otherwise delete `main/infra/terraform.tfstate*` before applying.
 
-To project a saved run onto HI-Small, HI-Medium and HI-Large: `python main/scripts/estimate.py --run run.json --mode live|full|month|demo` (live, the default: train on the history days, then stream the live days, the last 30% of busy days, in real time; full streams every busy day). Lines billed by the hour are scaled by hours running, lines billed by data by payments, and Glue, EMR and SageMaker by a run time worked out from the data size (Q2's is fitted on the run's own days). Athena queries and DynamoDB reads from the two apps are added for an assumed use (one person in each app 8 hours a day, reviewing 50 alerts or customers; the `APP_*`, `Q1_*` and `Q2_*` constants), since a demo run rarely has real app use. The Q1 Metrics page is left out. The label export's daily scan and deletes of the alerts table are counted too. CloudWatch (logs, metrics, the Kinesis alarm) is left out of both scripts: it comes to cents.
+## Testing
 
-## Problems
-
-| What you see | What to do |
-|---|---|
-| "security token ... is invalid" or "expired" | The lab session ended. Redo [step 2](#2-connect-to-your-aws-lab-account) |
-| `terraform apply` says something "already exists" | A resource with that name was made by hand earlier, outside Terraform. Delete the old one in the AWS console, or give ours a different name in `main/infra/` |
-| `terraform apply` says a file in `main/build/` is missing | Run `python main/scripts/build.py` first |
-| `terraform apply` fails on `aws_kinesisanalyticsv2_application` | The lab may not allow Managed Flink. Comment out that resource in `q1_streaming.tf` and the `flink_app` line in `outputs.tf`, apply again, and run `python main/Q1_files/flink/local_runner.py` in place of `pipeline.py start` |
-| An app's page does not load | Get the current address from `pipeline.py apps`. Use `http`. Wait 3 minutes if the server just started |
-| No alerts appear | `pipeline.py status` should show scoring RUNNING and an approved model. The log is in CloudWatch under `/aws/managed-flink/q1-realtime-flagging` |
-| The Q2 app says no nightly run has finished | The first simulated day has not ended yet, or the producer was started without `--q2 async` |
-| The Q2 run fails with "no rates for ..." | The exchange rates do not cover those dates. See [Using a different dataset](#using-a-different-dataset), step 3 |
-| The Q2 run fails at the EMR step | The error is in `s3://<bucket>/logs/emr/`. The lab allows only 9 servers at once |
-
-## Reference
-
-### All commands
-
-| Command | What it does |
-|---|---|
-| `pipeline.py setup` | Prepare the history and train the first model |
-| `pipeline.py start` / `stop` | Start or stop real-time scoring. `start --fresh` starts with empty memory |
-| `pipeline.py status` | Is scoring running, and which model is in use |
-| `pipeline.py apps` / `apps stop` / `apps start` | Show the apps' addresses; stop or start their server |
-| `pipeline.py reset --yes` | Clear the demo's results |
-| `pipeline.py retrain` | Train a new model and switch to it if it is better |
-| `pipeline.py q2 --run-date 2022-09-08` | Run the Q2 nightly job for one day by hand |
-| `pipeline.py labels` | Save investigators' finished decisions for the next training run |
-| `producer.py prepare` / `upload` / `replay` | Split the dataset, send it to AWS, replay it |
-| `producer.py dates` / `fx` | Show a dataset's dates; fetch exchange rates |
-| `producer.py clock show` / `pause` / `resume` | Look at or control the simulated clock |
-| `stress.py run` / `report` / `cleanup` | The stress test |
-
-`pipeline.py` is in `main/scripts/`. `producer.py` and `stress.py` are in `main/producer/`. Add `--help` to any of them.
-
-In `replay`, `--labels` and `--q2 async` start the two daily jobs at each simulated midnight. Without them, those jobs do not run.
-
-### Folders
-
-| Path | What it is |
-|---|---|
-| `PIPELINE_SPEC.md` | The design. Section 8 lists how it was built and where that differs |
-| `main/` | The current code |
-| `data/` | Where you put the downloaded dataset files. Not committed |
-| `zArchive/` | The first version. For reference only |
-
-Inside `main/`:
-
-| Path | What it is |
-|---|---|
-| `infra/` | The Terraform files. One per area: storage, Q1 streaming, Q1 training, Q2, the apps |
-| `scripts/` | `build.py` and `pipeline.py` |
-| `producer/` | `producer.py` and `stress.py` |
-| `common/` | Only what both Q1 and Q2 use: the rules for a valid payment, the simulated clock, `settings.json` |
-| `Q1_files/` | Real-time scoring (`flink/`), model training (`glue/`, `sagemaker/`), the investigators' app (`streamlit/`) |
-| `Q2_files/` | Data preparation (`glue/`), the nightly rules and ranking (`emr/`), the KYC app (`streamlit/`) |
-| `tests/` | Checks that run on your laptop without AWS |
-
-Three things appear when you run the commands and are not committed: `main/build/` (packaged code), `main/config.json` (the names of what Terraform built) and `main/producer/data/` (the prepared dataset).
-
-### Tests
-
-These run on your laptop without AWS. Run `producer.py prepare` first.
-
-```
+```bash
 pip install lightgbm scikit-learn
-python main/tests/test_core.py
-python main/tests/test_q1_local.py
-python main/tests/test_producer.py
+python main/producer/producer.py prepare --csv data/HI-Small_Trans.csv
+python -m pytest main/tests
 ```
 
-They cover the scoring code, model training, and the two producers. The parts that run on AWS have no local test.
+The tests cover feature computation, model scoring and training, and the producers. Components that run on AWS are not covered by local tests.

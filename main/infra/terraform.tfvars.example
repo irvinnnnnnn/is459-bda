@@ -1,9 +1,11 @@
-# Copy to terraform.tfvars and change what you need. Defaults target a personal AWS account.
+# Copy to terraform.tfvars. All other variables and their defaults are in variables.tf.
 
-# AWS Academy Learner Lab provides LabRole and LabInstanceProfile. Reuse them instead of creating
-# IAM resources. For Q2, the same role/profile can be used if the lab permissions allow EMR.
-# manage_iam_resources = false
-# role_name            = "LabRole"
+# Create the project's IAM roles and instance profiles.
+manage_iam_resources = true
+
+# AWS Academy Learner Lab: it cannot create IAM roles, so reuse its LabRole and LabInstanceProfile.
+# Set manage_iam_resources = false above and uncomment these.
+# role_name             = "LabRole"
 # apps_instance_profile = "LabInstanceProfile"
 # emr_service_role      = "LabRole"
 # emr_instance_profile  = "LabInstanceProfile"
