@@ -79,7 +79,8 @@ resource "terraform_data" "q1_model_versions" {
 
   provisioner "local-exec" {
     when    = destroy
-    command = "python -c \"import boto3; s = boto3.client('sagemaker', region_name='${self.input.region}'); [s.delete_model_package(ModelPackageName=p['ModelPackageArn']) for page in s.get_paginator('list_model_packages').paginate(ModelPackageGroupName='${self.input.group}') for p in page['ModelPackageSummaryList']]\""
+    # A script file, not `python -c "..."`: cmd.exe on Windows mangles the nested quotes.
+    command = "python ${path.module}/../scripts/delete_model_versions.py ${self.input.group} ${self.input.region}"
   }
 }
 
